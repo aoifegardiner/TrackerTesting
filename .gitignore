@@ -1,0 +1,32 @@
+# --- Global ignores for large or generated content ---
+data/
+debug_output/
+debug_flows/
+debug_flows_raw_left/
+stir_agardiner_submission.tar
+
+# --- Ignore model weights (anywhere in repo) ---
+*.pth
+*.pt
+*.h5
+
+# Unignore project code in these directories
+# ----------------------------
+!SurgT/**
+!MFT_WAFT/**
+
+# Then specifically ignore unwanted subfolders inside them
+# ----------------------------
+SurgT/data/
+MFT_WAFT/MFT/WAFT/depth-anything-ckpts/
+
+# --- Ignore Python cache and logs ---
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# --- Ignore IDE and system files ---
+.vscode/
+.DS_Store
+

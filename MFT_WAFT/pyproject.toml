@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "MFT"
+version = "0.0.1"
+readme = "readme.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "numpy >=1.24",
+    "einops",
+    "tqdm",
+    "opencv-contrib-python==4.5.5.64",
+    "scipy",
+    "Pillow>=9",
+    "matplotlib",
+    "ipdb"
+]
+                                                                                
+[project.urls]
+Homepage = "https://github.com/serycjon/MFT"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "MFT_files/*",
+]
+
+
+[tool.ruff]
+# Enable the pycodestyle (`E`) and Pyflakes (`F`) rules by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+select = ["E", "F"]
+ignore = []
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".direnv",
+    ".git",
+    ".ruff_cache",
+    "__pypackages__",
+    "venv",
+]
+per-file-ignores = {}
+
+# Same as Black.
+line-length = 160
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# Assume Python 3.8
+target-version = "py38"
+

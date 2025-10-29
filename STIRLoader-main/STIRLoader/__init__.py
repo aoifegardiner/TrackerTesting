@@ -1,0 +1,1 @@
+from .STIRLoader import getclips

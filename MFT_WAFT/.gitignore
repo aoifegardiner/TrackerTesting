@@ -1,0 +1,18 @@
+# emacs stuff
+[#]*[#]
+.\#*
+.dir-locals.el
+.envrc
+*.idea
+*~
+*__pycache__*
+*.pyc
+*.pytest_cache
+*.ipynb_checkpoints/
+/flowou_evals/
+cache/
+logs
+demo_out
+Makefile
+/train_files_lists/
+/runs/
