@@ -19,6 +19,7 @@ stir_agardiner_submission.tar
 # ----------------------------
 SurgT/data/
 MFT_WAFT/MFT/WAFT/depth-anything-ckpts/
+MFT_WAFT/datasets/
 
 # --- Ignore Python cache and logs ---
 __pycache__/
