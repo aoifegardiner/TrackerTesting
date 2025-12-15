@@ -94,51 +94,145 @@ class FlowDataset(data.Dataset):
         else:
             return occl
 
-    #@iex
+#    #@iex
+#    def __getitem__(self, index):
+#        """
+#        returns:
+#            img1: (3, H, W) float32 tensor with 0-255 RGB(!) values
+#            img2: (3, H, W) float32 tensor with 0-255 RGB(!) values
+#            flow: (2, H, W) float32 tensor with (xy-ordered?) flow
+#            valid: (1, H, W) float32 tensor with values 0 (invalid), and 1 (valid)
+#            occl: (1, H, W) float32 tensor with 0-1 occlusion mask
+#        """
+#        index = index % len(self.image_list)
+#
+#        if self.is_test:
+#            img1 = frame_utils.read_gen(self.image_list[index][0])
+#            img2 = frame_utils.read_gen(self.image_list[index][1])
+#            img1 = np.array(img1).astype(np.uint8)[..., :3]
+#            img2 = np.array(img2).astype(np.uint8)[..., :3]
+#            img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W', C=2).float()
+#            img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W', C=2).float()
+#            return img1, img2, self.extra_info[index]
+#
+#        if not self.init_seed:
+#            worker_info = torch.utils.data.get_worker_info()
+#            if worker_info is not None:
+#                torch.manual_seed(np.random.randint(0, 1024) + worker_info.id)
+#                np.random.seed(np.random.randint(0, 1024) + worker_info.id)
+#                random.seed(np.random.randint(0, 1024) + worker_info.id)
+#                self.init_seed = True
+#
+#        index = index % len(self.image_list)
+#        valid = None
+#        if self.sparse:
+#            flow, valid = frame_utils.read_gen_sparse_flow(self.flow_list[index])
+#            valid = einops.rearrange(valid, 'H W -> H W 1')  # np.expand_dims(valid, 2)
+#        else:
+#            flow = frame_utils.read_gen(self.flow_list[index])
+#
+#        img1 = frame_utils.read_gen(self.image_list[index][0])
+#        img2 = frame_utils.read_gen(self.image_list[index][1])
+#
+#        flow = np.array(flow).astype(np.float32)
+#        img1 = np.array(img1).astype(np.uint8)
+#        img2 = np.array(img2).astype(np.uint8)
+#
+#        # grayscale images
+#        if len(img1.shape) == 2:
+#            img1 = einops.repeat(img1, 'H W -> H W C', C=3)
+#            img2 = einops.repeat(img2, 'H W -> H W C', C=3)
+#        else:
+#            img1 = img1[..., :3]
+#            img2 = img2[..., :3]
+#
+#        if self.load_occlusion:
+#            occl = frame_utils.read_gen(self.occlusion_list[index])
+#            occl = np.array(occl).astype(np.float32)
+#            occl = self.normalise_occlusions_01(occl)
+#        else:
+#            H, W, C = img1.shape
+#            occl = np.zeros([H, W, 1], dtype=np.float32)
+#
+#        if len(occl.shape) == 2:
+#            occl = einops.rearrange(occl, 'H W -> H W 1')  # occl = np.expand_dims(occl, axis=2)
+#        else:
+#            occl = occl[:, :, 0:1]
+#
+#        if self.augmentor is not None:
+#            # if self.sparse:
+#            #     img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+#            # else:
+#            #     img1, img2, flow = self.augmentor(img1, img2, flow)
+#            # orig_occl = occl.copy()
+#            img1, img2, flow, valid, occl = self.augmentor(img1, img2, flow, valid, occl)
+#
+#        img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W', C=3).float()
+#        img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W', C=3).float()
+#        flow = einops.rearrange(torch.from_numpy(flow), 'H W xy -> xy H W', xy=2).float()
+#        occl = einops.rearrange(torch.from_numpy(occl), 'H W 1 -> 1 H W').float()
+#
+#        if valid is not None:
+#            valid = einops.rearrange(torch.from_numpy(valid), 'H W 1 -> 1 H W') > 0.99
+#            valid = valid & einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
+#        else:
+#            valid = einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
+#
+#        return img1, img2, flow, valid.float(), occl
+
     def __getitem__(self, index):
         """
         returns:
-            img1: (3, H, W) float32 tensor with 0-255 RGB(!) values
-            img2: (3, H, W) float32 tensor with 0-255 RGB(!) values
-            flow: (2, H, W) float32 tensor with (xy-ordered?) flow
-            valid: (1, H, W) float32 tensor with values 0 (invalid), and 1 (valid)
-            occl: (1, H, W) float32 tensor with 0-1 occlusion mask
+            img1: (3, H, W) float32 tensor with 0–255 RGB values
+            img2: (3, H, W) float32 tensor with 0–255 RGB values
+            flow: (2, H, W) float32 tensor (x,y flow)
+            valid: (1, H, W) float32 tensor (1 = valid)
+            occl: (1, H, W) float32 tensor (0–1 occlusion mask)
         """
         index = index % len(self.image_list)
 
-        if self.is_test:
+        # ===============================
+        # try to load safely
+        # ===============================
+        try:
+            if self.is_test:
+                img1 = frame_utils.read_gen(self.image_list[index][0])
+                img2 = frame_utils.read_gen(self.image_list[index][1])
+                img1 = np.array(img1).astype(np.uint8)[..., :3]
+                img2 = np.array(img2).astype(np.uint8)[..., :3]
+                img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W').float()
+                img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W').float()
+                return img1, img2, self.extra_info[index]
+
+            if not self.init_seed:
+                worker_info = torch.utils.data.get_worker_info()
+                if worker_info is not None:
+                    torch.manual_seed(np.random.randint(0, 1024) + worker_info.id)
+                    np.random.seed(np.random.randint(0, 1024) + worker_info.id)
+                    random.seed(np.random.randint(0, 1024) + worker_info.id)
+                    self.init_seed = True
+
+            valid = None
+            if self.sparse:
+                flow, valid = frame_utils.read_gen_sparse_flow(self.flow_list[index])
+                valid = einops.rearrange(valid, 'H W -> H W 1')
+            else:
+                flow = frame_utils.read_gen(self.flow_list[index])
+
             img1 = frame_utils.read_gen(self.image_list[index][0])
             img2 = frame_utils.read_gen(self.image_list[index][1])
-            img1 = np.array(img1).astype(np.uint8)[..., :3]
-            img2 = np.array(img2).astype(np.uint8)[..., :3]
-            img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W', C=2).float()
-            img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W', C=2).float()
-            return img1, img2, self.extra_info[index]
 
-        if not self.init_seed:
-            worker_info = torch.utils.data.get_worker_info()
-            if worker_info is not None:
-                torch.manual_seed(np.random.randint(0, 1024) + worker_info.id)
-                np.random.seed(np.random.randint(0, 1024) + worker_info.id)
-                random.seed(np.random.randint(0, 1024) + worker_info.id)
-                self.init_seed = True
-
-        index = index % len(self.image_list)
-        valid = None
-        if self.sparse:
-            flow, valid = frame_utils.read_gen_sparse_flow(self.flow_list[index])
-            valid = einops.rearrange(valid, 'H W -> H W 1')  # np.expand_dims(valid, 2)
-        else:
-            flow = frame_utils.read_gen(self.flow_list[index])
-
-        img1 = frame_utils.read_gen(self.image_list[index][0])
-        img2 = frame_utils.read_gen(self.image_list[index][1])
-
+        except Exception as e:
+            print(f"[WARN] Skipping index {index} due to read error: {e}")
+            # try the next sample recursively
+            new_index = (index + 1) % len(self)
+            return self.__getitem__(new_index)
+    
         flow = np.array(flow).astype(np.float32)
         img1 = np.array(img1).astype(np.uint8)
         img2 = np.array(img2).astype(np.uint8)
 
-        # grayscale images
+        # handle grayscale
         if len(img1.shape) == 2:
             img1 = einops.repeat(img1, 'H W -> H W C', C=3)
             img2 = einops.repeat(img2, 'H W -> H W C', C=3)
@@ -147,29 +241,30 @@ class FlowDataset(data.Dataset):
             img2 = img2[..., :3]
 
         if self.load_occlusion:
-            occl = frame_utils.read_gen(self.occlusion_list[index])
-            occl = np.array(occl).astype(np.float32)
-            occl = self.normalise_occlusions_01(occl)
+            try:
+                occl = frame_utils.read_gen(self.occlusion_list[index])
+                occl = np.array(occl).astype(np.float32)
+                occl = self.normalise_occlusions_01(occl)
+            except Exception as e:
+                print(f"[WARN] Skipping occlusion for index {index} due to error: {e}")
+                H, W, _ = img1.shape
+                occl = np.zeros([H, W, 1], dtype=np.float32)
         else:
-            H, W, C = img1.shape
+            H, W, _ = img1.shape
             occl = np.zeros([H, W, 1], dtype=np.float32)
 
         if len(occl.shape) == 2:
-            occl = einops.rearrange(occl, 'H W -> H W 1')  # occl = np.expand_dims(occl, axis=2)
+            occl = einops.rearrange(occl, 'H W -> H W 1')
         else:
             occl = occl[:, :, 0:1]
 
+        # data augmentation
         if self.augmentor is not None:
-            # if self.sparse:
-            #     img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
-            # else:
-            #     img1, img2, flow = self.augmentor(img1, img2, flow)
-            # orig_occl = occl.copy()
             img1, img2, flow, valid, occl = self.augmentor(img1, img2, flow, valid, occl)
 
-        img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W', C=3).float()
-        img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W', C=3).float()
-        flow = einops.rearrange(torch.from_numpy(flow), 'H W xy -> xy H W', xy=2).float()
+        img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W').float()
+        img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W').float()
+        flow = einops.rearrange(torch.from_numpy(flow), 'H W xy -> xy H W').float()
         occl = einops.rearrange(torch.from_numpy(occl), 'H W 1 -> 1 H W').float()
 
         if valid is not None:
@@ -179,6 +274,7 @@ class FlowDataset(data.Dataset):
             valid = einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
 
         return img1, img2, flow, valid.float(), occl
+
 
     def __rmul__(self, v):
         assert isinstance(v, int)
@@ -271,7 +367,7 @@ class FlowDataset(data.Dataset):
 
 class KubricDataset(FlowDataset):
     def __init__(self, aug_params=None, split='train',
-                 root='datasets/kubric_movi_e_longterm', load_occlusion=False,
+                 root='MFT_WAFT/datasets/kubric_movi_e_longterm', load_occlusion=False,
                  upsample2=False, correct_flow=False):
         """
         """
@@ -396,7 +492,7 @@ class KubricDataset(FlowDataset):
 
 
 class MpiSintel(FlowDataset):
-    def __init__(self, aug_params=None, split='training', root='datasets/Sintel-complete',
+    def __init__(self, aug_params=None, split='training', root='MFT_WAFT/datasets/Sintel-complete',
                  dstype='clean', load_occlusion=False, subsplit=None):
         """
         :param subsplit: None : whole training dataset
@@ -442,7 +538,7 @@ class MpiSintel(FlowDataset):
 
 
 class FlyingChairs(FlowDataset):
-    def __init__(self, aug_params=None, split='train', root='datasets/FlyingChairs_release/data'):
+    def __init__(self, aug_params=None, split='train', root='MFT_WAFT/datasets/FlyingChairs_release/data'):
         super(FlyingChairs, self).__init__(aug_params, root=root)
 
         images = sorted(glob(osp.join(root, '*.ppm')))
@@ -458,7 +554,7 @@ class FlyingChairs(FlowDataset):
 
 
 class FlyingThings3D(FlowDataset):
-    def __init__(self, aug_params=None, root='datasets/FlyingThings3D',
+    def __init__(self, aug_params=None, root='MFT_WAFT/datasets/FlyingThings3D',
                  dstype='frames_cleanpass', load_occlusion=False):
         super(FlyingThings3D, self).__init__(aug_params, load_occlusion=load_occlusion, root=root)
 
@@ -497,9 +593,47 @@ class FlyingThings3D(FlowDataset):
 
             self.save_cache(self.save_file_path)
 
+class FlyingThings3DOcclusionOnly(FlowDataset):
+    def __init__(self, aug_params=None, root='MFT_WAFT/datasets/FlyingThings3D',
+                 dstype='frames_cleanpass/frames_cleanpass', load_occlusion=True):
+        super().__init__(aug_params, load_occlusion=load_occlusion, root=root)
+
+        self.save_file_path = f'train_files_lists/FlyingThings3D_{dstype}_occlonly'
+        if not self.load_cache(self.save_file_path):
+            for cam in ['left']:
+                for direction in ['into_future', 'into_past']:
+                    image_dirs = sorted(glob(osp.join(root, dstype, 'TRAIN/*/*')))
+                    image_dirs = sorted([osp.join(f, cam) for f in image_dirs])
+
+                    # We no longer load optical_flow; we only use occlusion maps
+                    occl_dirs = sorted(glob(osp.join(root, 'optical_flow_occlusion_png/optical_flow_occlusion_png/TRAIN/*/*')))
+                    occl_dirs = sorted([osp.join(f, direction, cam) for f in occl_dirs])
+                    print(occl_dirs)
+                    for idir, odir in zip(image_dirs, occl_dirs):
+                        images = sorted(glob(osp.join(idir, '*.png')))
+                        occl_files = sorted(glob(osp.join(odir, '*.png')))
+
+                        for i in range(len(occl_files) - 1):
+                            if direction == 'into_future':
+                                im1 = images[i]
+                                im2 = images[i + 1]
+                                occl = occl_files[i]
+                            else:  # into_past
+                                im1 = images[i + 1]
+                                im2 = images[i]
+                                occl = occl_files[i + 1]
+
+                            if all([os.path.isfile(x) for x in [occl, im1, im2]]):
+                                self.image_list += [[im1, im2]]
+                                self.occlusion_list += [occl]
+
+            # Since we don’t have flow, create dummy paths
+            self.flow_list = [None] * len(self.image_list)
+            self.save_cache(self.save_file_path)    
+
 
 class KITTI(FlowDataset):
-    def __init__(self, aug_params=None, split='training', root='datasets/KITTI/basic/'):
+    def __init__(self, aug_params=None, split='training', root='MFT_WAFT/datasets/KITTI/basic/'):
         super(KITTI, self).__init__(aug_params, sparse=True, root=root)
         if split == 'testing':
             self.is_test = True
@@ -520,7 +654,7 @@ class KITTI(FlowDataset):
 
 
 class HD1K(FlowDataset):
-    def __init__(self, aug_params=None, root='datasets/HD1K'):
+    def __init__(self, aug_params=None, root='MFT_WAFT/datasets/HD1K'):
         super(HD1K, self).__init__(aug_params, sparse=True, root=root)
 
         seq_ix = 0

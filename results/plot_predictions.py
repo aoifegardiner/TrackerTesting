@@ -28,6 +28,37 @@ def plot_predicted_vs_gt(predictions_pkl, gt_yaml, output_dir):
 
     gt_centers_x, gt_centers_y, gt_frames = [], [], []
 
+    # Filter GT values to only frames where we have predictions
+    valid_mask = np.isin(gt_frames, frame_indices)
+    gt_frames_sync = gt_frames[valid_mask]
+    gt_centers_x_sync = gt_centers_x[valid_mask]
+    gt_centers_y_sync = gt_centers_y[valid_mask]
+
+    # Align predictions to these frames
+    pred_idx_map = {f: i for i, f in enumerate(frame_indices)}
+    pred_centers_x_sync = np.array([pred_centers_x[pred_idx_map[f]] for f in gt_frames_sync])
+    pred_centers_y_sync = np.array([pred_centers_y[pred_idx_map[f]] for f in gt_frames_sync])
+
+    # Compute magnitude error per frame
+    diff_x = pred_centers_x_sync - gt_centers_x_sync
+    diff_y = pred_centers_y_sync - gt_centers_y_sync
+    magnitude_error = np.sqrt(diff_x**2 + diff_y**2)
+
+    # --- Plot magnitude error ---
+    plt.figure(figsize=(10, 5))
+    plt.plot(gt_frames_sync, magnitude_error, label="Center Error Magnitude")
+    plt.xlabel("Frame Number")
+    plt.ylabel("Error Magnitude (pixels)")
+    plt.title("Tracking Error Magnitude per Frame")
+    plt.grid(True)
+    plt.legend()
+
+    out_path_mag = output_dir / "trajectory_error_magnitude_case2.png"
+    plt.savefig(out_path_mag, bbox_inches="tight", dpi=150)
+    plt.close()
+
+    print(f"✅ Magnitude error plot saved to: {out_path_mag}")
+
     # Iterate through each frame index and entry
     for frame_id, frame_entry in gt_data.items():
         # Each entry is (visible, difficult, (bbox_left, bbox_right))
@@ -58,7 +89,7 @@ def plot_predicted_vs_gt(predictions_pkl, gt_yaml, output_dir):
     plt.legend()
     plt.grid(True)
 
-    out_path = output_dir / "trajectory_comparison_waft_new.png"
+    out_path = output_dir / "trajectory_comparison_case2.png"
     plt.savefig(out_path, bbox_inches="tight", dpi=150)
     plt.close()
 
@@ -66,7 +97,7 @@ def plot_predicted_vs_gt(predictions_pkl, gt_yaml, output_dir):
 
 if __name__ == "__main__":
     plot_predicted_vs_gt(
-        predictions_pkl="results/case1_video1_left/case1_video1_left_predictions_waft.pkl",
-        gt_yaml="/Workspace/agardiner_STIR_submission/data/test/case_1/1/gt_rectified_0.yaml",
+        predictions_pkl="results/case1_video1_left/case1_video1_left_predictions_waft_new.pkl",
+        gt_yaml="/Workspace/agardiner_STIR_submission/data/test/case_2/1/gt_rectified_0.yaml",
         output_dir="results/case1_video1_left"
     )

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from types import SimpleNamespace
 import logging
-from MFT_WAFT.MFT.waft import FlowOUTrackingResult
+from MFT_WAFT.MFT.waft  import FlowOUTrackingResult as FlowOUTrackingResult
 from MFT_WAFT.MFT.utils.timing import general_time_measurer
 
 logger = logging.getLogger(__name__)
@@ -171,7 +171,6 @@ class MFT():
         selected_sigmas = einops.rearrange(selected_sigmas, '1 1 H W -> 1 H W', H=self.img_H, W=self.img_W)
 
         result = FlowOUTrackingResult(selected_flow, selected_occlusion, selected_sigmas)
-
         # mark flows pointing outside of the current image as occluded
         invalid_mask = einops.rearrange(result.invalid_mask(), 'H W -> 1 H W')
         result.occlusion[invalid_mask] = 1

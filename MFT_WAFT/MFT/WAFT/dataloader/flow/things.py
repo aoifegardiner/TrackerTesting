@@ -11,8 +11,8 @@ from tqdm import tqdm
 from glob import glob
 import os.path as osp
 
-from utils import frame_utils
-from dataloader.template import FlowDataset
+from MFT_WAFT.MFT.WAFT.utils import frame_utils
+from MFT_WAFT.MFT.WAFT.dataloader.template import FlowDataset
 
 class FlyingThings3D(FlowDataset):
     def __init__(self, aug_params=None, root='datasets/FlyingThings3D', dstype='frames_cleanpass'):

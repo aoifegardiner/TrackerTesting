@@ -14,10 +14,10 @@ import os.path as osp
 
 import sys
 sys.path.append(os.getcwd())
-from utils import frame_utils
-from dataloader.template import FlowDataset
-from utils.utils import check_cycle_consistency, induced_flow
-from utils.flow_viz import flow_to_image
+from MFT_WAFT.MFT.WAFT.utils import frame_utils
+from MFT_WAFT.MFT.WAFT.dataloader.template import FlowDataset
+from MFT_WAFT.MFT.WAFT.utils.utils import check_cycle_consistency, induced_flow
+from MFT_WAFT.MFT.WAFT.utils.flow_viz import flow_to_image
 
 K = np.array([[320, 0, 320],
               [0, 320, 240],

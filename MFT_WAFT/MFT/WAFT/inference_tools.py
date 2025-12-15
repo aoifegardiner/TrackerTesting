@@ -85,16 +85,23 @@ class InferenceWrapper(object):
                     elif 'info' in key:
                         output[key] = [torch.zeros((n, 4, h, w), device=image1.device) for _ in range(len(output_ij[key]))]
                     else:
-                        output[key] = [torch.zeros((n, 2, h, w), device=image1.device) for _ in range(len(output_ij[key]))]
+                        output[key] = output_ij[key]
+            
+            for key in output_ij:
+                if key in ("occlusion", "uncertainty"):
+                    # Only one output
+                    output[key][0][:, :, hl:hr, wl:wr] += weight * output_ij[key][0]
+                    continue
 
-            for i in range(len(output_ij['flow'])):
-                for key in output.keys():
-                    output[key][i][:, :, hl: hr, wl: wr] += weight * output_ij[key][i]
-        
-        for i in range(len(output['flow'])):
-            for key in output.keys():
+                # Normal multi-step outputs (flow, info)
+                for i in range(len(output_ij[key])):
+                    output[key][i][:, :, hl:hr, wl:wr] += weight * output_ij[key][i]
+
+        # Normalize
+        for key in output:
+            for i in range(len(output[key])):
                 output[key][i] /= valid.unsqueeze(1)
-        
+
         return output
 
     def forward_flow(self, image1, image2):
@@ -125,9 +132,21 @@ class InferenceWrapper(object):
 
         output = self.patch_inference(image1, image2, patches, tile_h, tile_w)
 
-        for i in range(len(output['flow'])):
-            for key in output.keys():
-                output[key][i] = output[key][i][:, :, inf_pad_h // 2: inf_pad_h // 2 + H, inf_pad_w // 2: inf_pad_w // 2 + W]
+        #for i in range(len(output['flow'])):
+        #    for key in output.keys():
+        #        output[key][i] = output[key][i][:, :, inf_pad_h // 2: inf_pad_h // 2 + H, inf_pad_w // 2: inf_pad_w // 2 + W]
+        for key in output.keys():
+            if key in ("occlusion", "uncertainty"):
+                continue  
+            
+            for i in range(len(output[key])):
+                output[key][i] = output[key][i][
+                    :,
+                    :,
+                    inf_pad_h // 2 : inf_pad_h // 2 + H,
+                    inf_pad_w // 2 : inf_pad_w // 2 + W,
+                ]
+
 
         return output
     
@@ -138,6 +157,10 @@ class InferenceWrapper(object):
         output = self.forward_flow(img1, img2)
         for i in range(len(output['flow'])):
             for key in output.keys():
+                if key in ("occlusion", "uncertainty"):
+                    # Do NOT tile, do NOT rescale using flow count
+                    continue
+
                 if 'flow' in key:
                     output[key][i] = F.interpolate(output[key][i], scale_factor=0.5 ** self.scale, mode='bilinear', align_corners=True) * (0.5 ** self.scale)
                 else:

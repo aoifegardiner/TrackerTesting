@@ -1,14 +1,17 @@
 from pathlib import Path
 import torch
 import numpy as np
-from MFT_WAFT.MFT.config import load_config
+from agardiner_waft.MFT_WAFT.MFT.config import load_config
+#from agardiner_waft.MFT_WAFT.MFT.point_tracking import convert_to_point_tracking
 
-CONFIG = Path("/Workspace/agardiner_STIR_submission/MFT_WAFT/MFT/MFT_files/configs/MFT_cfg.py")
+#CONFIG = Path("/Workspace/agardiner_STIR_submission/MFT_WAFT/MFT/MFT_files/configs/MFT_cfg.py")
+CONFIG = Path("/Workspace/agardiner_waft/MFT_WAFT/MFT/MFT_files/configs/MFT_cfg.py")
 
 import sys, importlib, os
 
 # Ensure our local WAFT implementation is used instead of the installed one
-local_waft_path = "/Workspace/agardiner_STIR_submission/MFT_WAFT/MFT"
+#local_waft_path = "/Workspace/agardiner_STIR_submission/MFT_WAFT/MFT"
+local_waft_path = "/Workspace/agardiner_waft/MFT_WAFT/MFT"
 if local_waft_path not in sys.path:
     sys.path.insert(0, local_waft_path)
 print("[DEBUG] sys.path[0] set to:", sys.path[0])
@@ -25,7 +28,9 @@ print("[DEBUG] Forced WAFTWrapper loaded from:", inspect.getfile(waft_module))
 
 class MFTWAFTTrackerSurgT:
     def __init__(self, im1, bbox1_gt, steps=5):
+        print("Calling load_config with:", CONFIG)
         cfg = load_config(CONFIG)
+        print("Loaded config:", cfg)
         import MFT_WAFT
         import importlib
 
@@ -42,7 +47,9 @@ class MFTWAFTTrackerSurgT:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Initialize tracker ONCE
+        #raw = cfg.tracker_class(cfg)
         self.tracker = cfg.tracker_class(cfg)
+        print(f"[DEBUG] Initialized tracker of type: {type(self.tracker).__name__}")
         self.tracker.init(im1)
         self.initialized = True
 
@@ -64,35 +71,97 @@ class MFTWAFTTrackerSurgT:
         w = max(1, min(W - x, x_max - x_min)); h = max(1, min(H - y, y_max - y_min))
         return [x, y, w, h]
 
+#    def tracker_update(self, im1):
+#        """
+#        Temporal update — accumulates flow from initial frame → current frame.
+#        """
+#
+#        print(f"[DEBUG] tracker type: {type(self.tracker).__name__}")
+#
+#        meta = self.tracker.track(im1)
+#        print(f"[DEBUG] track() returned type: {type(meta).__name__}")
+#        # Some configs return a namespace (with .result), some return FlowOUTrackingResult directly
+#        flow_result = meta.result if hasattr(meta, "result") else meta
+#        print(f"[DEBUG] flow_result type: {type(flow_result).__name__}")
+#        print(f"[DEBUG] flow_result has attributes: {dir(flow_result)}")
+#        print(f"[DEBUG] flow_result.flow shape: {flow_result.flow.shape}")
+#        # Warp the initial queries through current cumulative flow
+#        coords_np = flow_result.warp_forward_points(self.init_queries).detach().cpu().numpy()
+#
+#        # === DEBUG diagnostic ===
+#        if not hasattr(self, "_prev_coords"):
+#            self._prev_coords = coords_np.copy()
+#        else:
+#            delta_from_prev = np.mean(coords_np - self._prev_coords, axis=0)
+#            delta_from_init = np.mean(coords_np - self.init_queries.cpu().numpy(), axis=0)
+#            #print(f"[DEBUG] Mean Δ(prev): {delta_from_prev},  Mean Δ(init): {delta_from_init}")
+#            self._prev_coords = coords_np.copy()
+#        # === end DEBUG ===
+#        
+#
+#        # Warp initial query points through cumulative flow
+#        H, W = im1.shape[:2]
+#        bbox_pred = self._points_to_bbox_xywh(coords_np, H, W)
+#        self.last_bbox = bbox_pred
+#        return bbox_pred
+    
     def tracker_update(self, im1):
         """
-        Temporal update — accumulates flow from initial frame → current frame.
+        Temporal update — accumulate flow incrementally.
         """
 
         print(f"[DEBUG] tracker type: {type(self.tracker).__name__}")
 
         meta = self.tracker.track(im1)
-
-        # Some configs return a namespace (with .result), some return FlowOUTrackingResult directly
         flow_result = meta.result if hasattr(meta, "result") else meta
 
-        # Warp the initial queries through current cumulative flow
-        coords_np = flow_result.warp_forward_points(self.init_queries).detach().cpu().numpy()
-
-        # === DEBUG diagnostic ===
-        if not hasattr(self, "_prev_coords"):
-            self._prev_coords = coords_np.copy()
-        else:
-            delta_from_prev = np.mean(coords_np - self._prev_coords, axis=0)
-            delta_from_init = np.mean(coords_np - self.init_queries.cpu().numpy(), axis=0)
-            #print(f"[DEBUG] Mean Δ(prev): {delta_from_prev},  Mean Δ(init): {delta_from_init}")
-            self._prev_coords = coords_np.copy()
-        # === end DEBUG ===
+        print(f"[DEBUG] flow_result.flow shape: {flow_result.flow.shape}")
+        # Before warping
+        #center = self.init_queries.mean(dim=0, keepdim=True)  # (1,2)
+        #flow_at_center = flow_result.warp_forward_points(center)
+        #print(f"[DEBUG] init center: {center[0].tolist()} -> {flow_at_center[0].tolist()}  (Δ = {(flow_at_center - center)[0].tolist()})")
         
+        # --------------------------------------------------------
+        #  FIX: accumulate flow INCREMENTALLY, not from init frame
+        # --------------------------------------------------------
+        #if not hasattr(self, "prev_queries"):
+        #    # First frame after init
+        #    self.prev_queries = self.init_queries.clone().to(self.device)
+        
+        init_queries = self.init_queries.to(flow_result.flow.device)
+
+        new_coords = flow_result.warp_forward_points(init_queries)
+        new_coords_np = new_coords.detach().cpu().numpy()
 
 
-        # Warp initial query points through cumulative flow
+        center = init_queries.mean(dim=0, keepdim=True)
+        center_new = new_coords.mean(dim=0, keepdim=True)
+        print(f"[DEBUG] init center: {center[0].tolist()} -> {center_new[0].tolist()} "
+              f" (Δ = {(center_new - center)[0].tolist()})")
+
         H, W = im1.shape[:2]
-        bbox_pred = self._points_to_bbox_xywh(coords_np, H, W)
+        bbox_pred = self._points_to_bbox_xywh(new_coords_np, H, W)
         self.last_bbox = bbox_pred
-        return bbox_pred
+
+
+        # Warp previous points using F(t→t+1)
+        #new_coords = flow_result.warp_forward_points(self.prev_queries)
+        #new_coords_np = new_coords.detach().cpu().numpy()
+
+        # Save for next iteration
+        #self.prev_queries = new_coords.detach()
+
+        #H, W = im1.shape[:2]
+        #bbox_pred = self._points_to_bbox_xywh(new_coords_np, H, W)
+        #self.last_bbox = bbox_pred
+
+        occl_map = getattr(flow_result, "occlusion", None)
+        uncert_map = getattr(flow_result, "uncertainty", None)
+
+        return {
+           "bbox": bbox_pred,
+           "occlusion": occl_map,
+           "uncertainty": uncert_map
+        }       
+    
+

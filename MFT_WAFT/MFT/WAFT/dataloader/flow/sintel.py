@@ -11,11 +11,11 @@ from tqdm import tqdm
 from glob import glob
 import os.path as osp
 
-from utils import frame_utils
-from dataloader.template import FlowDataset
+from MFT_WAFT.MFT.WAFT.utils import frame_utils
+from MFT_WAFT.MFT.WAFT.dataloader.template import FlowDataset
 
 class MpiSintel(FlowDataset):
-    def __init__(self, aug_params=None, split='training', root='datasets/Sintel', dstype='clean'):
+    def __init__(self, aug_params=None, split='training', root='MFT_WAFT/datasets/Sintel-complete', dstype='clean'):
         super(MpiSintel, self).__init__(aug_params)
         flow_root = osp.join(root, split, 'flow')
         image_root = osp.join(root, split, dstype)

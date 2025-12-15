@@ -5,6 +5,7 @@ from SurgT.src import utils
 #from src.sample_tracker import Tracker
 from SurgT.src.waft_left import MFTWAFTTrackerSurgT as Tracker
 #from SurgT.src.mft_left import MFTRAFTTrackerSurgT as Tracker
+#from SurgT.src.TAP import TAPIRTrackerSurgT as Tracker
 
 import cv2 as cv
 import numpy as np
@@ -700,9 +701,9 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
 
     # === Setup output directory ===
     base_output = config_results.get("results_path", "./results")
-    output_dir = Path(base_output) / "case1_video1_left"
+    output_dir = Path(base_output) / "case1_video1_left_0212_2"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "case1_video1_left_predictions_waft_new.pkl"
+    output_file = output_dir / "case1_video1_left_predictions_0212_2.pkl"
 
     # === Visualization setup ===
     if not is_visualization_off:
@@ -711,12 +712,14 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
         cv.namedWindow(window_name, cv.WINDOW_KEEPRATIO)
 
     # === Initialize Video Writer ===
-    video_out_path = output_dir / "case1_video1_left_tracking_new.mp4"
+    video_out_path = output_dir / "case1_video1_left_tracking_0212_2.mp4"
     writer = None  # we'll initialize once we know the frame size
 
     # === Initialize ===
     t = None
     predicted_positions = []
+    occlusion = []
+    uncertainty_scores = []
     frame_indices = []
     is_track_fail_2d = False
 
@@ -753,6 +756,12 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
 
         # === Initialize tracker at the anchor ===
         if t is None:
+            print(
+                f"[DEBUG] Anchor frame {v.frame_counter}: "
+                f"bbox1_gt={bbox1_gt}, "
+                f"is_difficult={is_difficult}, "
+                f"is_inside={v.is_bbox_inside_image(bbox1_gt, bbox1_gt) if bbox1_gt else 'N/A'}"
+            )
             if bbox1_gt is not None and not is_difficult:
                 if v.is_bbox_inside_image(bbox1_gt, bbox1_gt):
                     t = Tracker(im1, bbox1_gt)
@@ -766,7 +775,13 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
             continue
 
         time.monitor_time_start()
-        bbox1_p = t.tracker_update(im1)
+        result = t.tracker_update(im1)
+
+        bbox1_p = result["bbox"]
+        occl_map = result["occlusion"]
+        uncert_map = result["uncertainty"]
+
+        #bbox1_p = t.tracker_update(im1)
         time.monitor_time_end()
 
         if bbox1_p is None:
@@ -776,13 +791,39 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
         # Save predictions
         predicted_positions.append(bbox1_p)
         frame_indices.append(v.frame_counter)
+        occlusion.append(occl_map)
+        uncertainty_scores.append(uncert_map)
         print(f"[Frame {v.frame_counter:03d}] Predicted bbox (left): {bbox1_p}")
+
+        # === Print occlusion stats ===
+        if occl_map is not None:
+            occ_np = occl_map.detach().cpu().numpy()
+            print(
+                f"   Occlusion stats → "
+                f"mean={occ_np.mean():.4f}, "
+                f"min={occ_np.min():.4f}, "
+                f"max={occ_np.max():.4f}"
+            )
+        else:
+            print("   Occlusion stats → None")
+
+        # === Print sigma / uncertainty stats ===
+        if uncert_map is not None:
+            sigma_np = uncert_map.detach().cpu().numpy()
+            print(
+                f"   Sigma stats     → "
+                f"mean={sigma_np.mean():.4f}, "
+                f"min={sigma_np.min():.4f}, "
+                f"max={sigma_np.max():.4f}"
+            )
+        else:
+            print("   Sigma stats     → None")
 
         # Optionally compute IoU
         flag_fail_2d, _, iou = ar.calculate_bbox_metrics(bbox1_gt, bbox1_p, None, None, False, False)
         kss.add_iou_score(iou, v.frame_counter)
 
-        # Visualization (for display + video)
+        ## Visualization (for display + video)
         line_thickness = 2
         frame_aug = draw_bb_in_frame(im1, None, bbox1_gt, bbox1_p, None, None, is_difficult, line_thickness)
         writer.write(frame_aug)  # <--- write augmented frame to video
@@ -798,13 +839,16 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
     # === Save results ===
     results = {
         "frame_indices": frame_indices,
-        "predicted_bboxes": predicted_positions
+        "predicted_bboxes": predicted_positions,
+        "occlusion_maps": occlusion,
+        "uncertainty_scores": uncertainty_scores
     }
 
     with open(output_file, "wb") as f:
         pickle.dump(results, f)
 
     print(f"\n✅ Saved {len(predicted_positions)} predictions to {output_file}")
+
 
     # === Release writer and print performance ===
     if writer is not None:
@@ -934,13 +978,14 @@ def assess_keypoint(time, v, kpt_anchors, kss, stats_kpt, config_results, is_vis
                            config_results["err_3d_threshold"],
                            v.Q)
         assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results)
-        break  
+        #break  
         stats_anchor = Statistics() # To support multiple keypoints
         ar.get_full_metric(stats_anchor)
         print_results("\t\t\tAnchor {}, ".format(anch_id), stats_anchor)
         stats_kpt.append_stats(stats_anchor)
         # Re-start video for next anchor, or for next keypoint
         v.video_restart()
+        return   
     assert len(stats_kpt.acc) == len(kpt_anchors) # Check that we have a acc list for each anchor
     stats_kpt.merge_stats()
 
@@ -1045,7 +1090,7 @@ def calculate_results(config, valid_or_test, is_visualization_off):
     if config_data["is_to_evaluate"]:
         print('{} dataset'.format(valid_or_test).upper())
         cases = utils.get_cases(config_data)
-
+        #cases = cases[1:]  # Only the second case for debugging
         # Go through each case
         for case in cases:
             stats_case = Statistics()  # Statistics for a specific case

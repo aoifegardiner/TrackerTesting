@@ -9,6 +9,7 @@ stir_agardiner_submission.tar
 *.pth
 *.pt
 *.h5
+*.pkl
 
 # Unignore project code in these directories
 # ----------------------------

@@ -1,0 +1,93 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            m9ftnwigdtctr6v4jj7ea0qiueft2dlz:
+                args:
+                    - --cfg
+                    - MFT_WAFT/MFT/WAFT/config/chairs-things.json
+                    - --restore_ckpt
+                    - MFT_WAFT/MFT/WAFT/ckpts/chairs-things.pth
+                codePath: MFT_WAFT/MFT/WAFT/train.py
+                codePathLocal: MFT_WAFT/MFT/WAFT/train.py
+                cpu_count: 128
+                cpu_count_logical: 256
+                cudaVersion: "12.2"
+                disk:
+                    /:
+                        total: "1888426192896"
+                        used: "1411013861376"
+                email: agardine@tcd.ie
+                executable: /opt/conda/bin/python
+                git:
+                    commit: 010dfb07536a06b9dcdaf1620e1bee5138836afa
+                    remote: git@github.com:aoifegardiner/TrackerTesting.git
+                gpu: NVIDIA A100-SXM4-40GB
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-22178345-d332-74cc-fd01-bddac0fa7129
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-dfea8e37-558c-9714-5ec0-4d1ed747ae6c
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-74ffa2af-752b-964e-fe29-6c9efaa3e289
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-59c1bd3e-4cb0-7bdc-5c48-80f2215a7659
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-87d329b0-ebe3-beaa-84c9-b89c21dce162
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-bb16a68b-1d01-2f05-c200-03d0f780422d
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-e91ea433-d4e2-4266-1ace-34f4ce79a181
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "42949672960"
+                      name: NVIDIA A100-SXM4-40GB
+                      uuid: GPU-62ccffbf-675c-dd7a-3256-883a5249f6c8
+                host: a091f6e4f788
+                memory:
+                    total: "1081993687040"
+                os: Linux-5.4.0-192-generic-x86_64-with-glibc2.10
+                program: /Workspace/agardiner_STIR_submission/MFT_WAFT/MFT/WAFT/train.py
+                python: CPython 3.8.5
+                root: /Workspace/agardiner_STIR_submission
+                startedAt: "2025-11-26T15:55:34.829032Z"
+                writerId: m9ftnwigdtctr6v4jj7ea0qiueft2dlz
+        m: []
+        python_version: 3.8.5
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+            "4": 3.8.5
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": linux-x86_64

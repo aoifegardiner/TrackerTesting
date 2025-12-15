@@ -343,10 +343,8 @@ class WAFTWrapper:
 
             # === DEBUG: Inspect WAFT outputs ===
             if isinstance(out, dict):
-                print("\n[WAFT DEBUG] Output keys:", list(out.keys()))
                 if "info" in out:
                     info_last = out["info"][-1][0]  # (4, H, W)
-                    print(f"[WAFT DEBUG] info_last shape: {info_last.shape}")
                     for i in range(info_last.shape[0]):
                         ch = info_last[i]
                         print(f"  Channel {i}: min={ch.min().item():.3f}, max={ch.max().item():.3f}, mean={ch.mean().item():.3f}")

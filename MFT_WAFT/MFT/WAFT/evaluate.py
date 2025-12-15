@@ -1,429 +1,183 @@
-import sys
 import math
-import argparse
 import numpy as np
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.data as data
-
-#from torchvision import transforms
-
-
-from config.parser import parse_args
-
+from torch import nn
+from torch.autograd import no_grad
 from tqdm import tqdm
-from model import fetch_model
-from utils.utils import resize_data, load_ckpt
 
-from dataloader.flow.chairs import FlyingChairs
-from dataloader.flow.things import FlyingThings3D
-from dataloader.flow.sintel import MpiSintel
-from dataloader.flow.kitti import KITTI
-from dataloader.flow.spring import Spring
-from dataloader.flow.hd1k import HD1K
-from dataloader.flow.testvid import testvid
-from dataloader.stereo.tartanair import TartanAir
-from dataloader.stereo.stir import STIR
-from utils.flow_viz import flow_to_image
-from scipy.ndimage import center_of_mass
-from torch.utils.data import DataLoader
-
-from inference_tools import InferenceWrapper, AverageMeter
-
-val_loss = AverageMeter()
-val_epe = AverageMeter()
-val_fl = AverageMeter()
-val_px1 = AverageMeter()
-
-def reset_all_metrics():
-    val_loss.reset()
-    val_epe.reset()
-    val_fl.reset()
-    val_px1.reset()
-
-def update_metrics(args, output, flow_gt, valid):
-    flow = output['flow'][-1]
-    batch_size = flow.shape[0]
-    epe = torch.sum((flow - flow_gt)**2, dim=1).sqrt()
-    mag = torch.sum(flow_gt**2, dim=1).sqrt()
-    val = valid >= 0.5
-    out = ((epe > 3.0) & ((epe/mag) > 0.05)).float()
-    px1 = (epe < 1.0).float()
-    nf = []
-    for i in range(len(output['flow'])):                 
-        raw_b = output['info'][i][:, 2:]
-        log_b = torch.zeros_like(raw_b)
-        weight = output['info'][i][:, :2]
-        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=args.var_max)
-        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=args.var_min, max=0)
-        term2 = ((flow_gt - output['flow'][i]).abs().unsqueeze(2)) * (torch.exp(-log_b).unsqueeze(1))
-        term1 = weight - math.log(2) - log_b
-        nf_loss = torch.logsumexp(weight, dim=1, keepdim=True) - torch.logsumexp(term1.unsqueeze(1) - term2, dim=2)
-        nf.append(nf_loss.mean(dim=1))
-
-    loss = torch.zeros_like(nf[-1])
-    for i in range(len(nf)):
-        loss += (args.gamma ** (len(nf) - i - 1)) * nf[i]
-    for i in range(batch_size):
-        val_epe.update(epe[i][val[i]].mean().item(), 1)
-        val_px1.update(px1[i][val[i]].mean().item(), 1)
-        val_fl.update(100 * out[i][val[i]].sum().item(), val[i].sum().item())
-        val_loss.update(loss[i][val[i]].mean().item(), 1)
-
-@torch.no_grad()
-def validate_sintel(args, model):
-    """ Peform validation using the Sintel (train) split """
-    for dstype in ['clean', 'final']:
-        reset_all_metrics()
-        val_dataset = MpiSintel(split='training', dstype=dstype)
-        val_loader = data.DataLoader(val_dataset, batch_size=1, 
-            pin_memory=False, shuffle=False, num_workers=16, drop_last=False)
-        pbar = tqdm(total=len(val_loader))
-        print(f"load data success {len(val_loader)}")
-        for i_batch, data_blob in enumerate(val_loader):
-            image1, image2, flow_gt, valid = [x.cuda(non_blocking=True) for x in data_blob]
-            output = model.calc_flow(image1, image2)
-            update_metrics(args, output, flow_gt, valid)
-            pbar.update(1)
-        pbar.close()
-        print(f"Validation {dstype} EPE: {val_epe.avg}, 1px: {100 * (1 - val_px1.avg)}")
-
-@torch.no_grad()
-def validate_kitti(args, model):
-    """ Peform validation using the KITTI-2015 (train) split """
-    val_dataset = KITTI(split='training')
-    val_loader = data.DataLoader(val_dataset, batch_size=1, 
-        pin_memory=False, shuffle=False, num_workers=16, drop_last=False)
-    print(f"load data success {len(val_loader)}")
-    reset_all_metrics()
-    for i_batch, data_blob in enumerate(val_loader):
-        image1, image2, flow_gt, valid_gt = [x.cuda(non_blocking=True) for x in data_blob]
-        output = model.calc_flow(image1, image2)
-        update_metrics(args, output, flow_gt, valid_gt)
-    
-    print("Validation KITTI: %f, %f" % (val_epe.avg, val_fl.avg))
-
-@torch.no_grad()
-def validate_spring(args, model):
-    """ Peform validation using the Spring (val) split """
-    val_dataset = Spring(split='val') #+ Spring(split='train')
-    val_loader = data.DataLoader(val_dataset, batch_size=1, 
-        pin_memory=False, shuffle=False, num_workers=16, drop_last=False)
-    
-    reset_all_metrics()
-    print(f"load data success {len(val_loader)}")
-    pbar = tqdm(total=len(val_loader))
-    for i_batch, data_blob in enumerate(val_loader):
-        image1, image2, flow_gt, valid = [x.cuda(non_blocking=True) for x in data_blob]
-        output = model.calc_flow(image1, image2)
-        update_metrics(args, output, flow_gt, valid)
-        pbar.update(1)
-
-    pbar.close()
-    print(f"Validation Spring EPE: {val_epe.avg}, 1px: {100 * (1 - val_px1.avg)}, loss: {val_loss.avg}")
-
-
-@torch.no_grad()
-def validate_chairs(args, model):
-    """ Perform validation using the Chairs (val) split and save predicted flow as .pt """
-
-    from pathlib import Path
-
-    val_dataset = FlyingChairs(split='validation') 
-    val_loader = data.DataLoader(val_dataset, batch_size=1, 
-        pin_memory=False, shuffle=False, num_workers=16, drop_last=False)
-
-    reset_all_metrics()
-
-    predicted_flows = []  # List to collect predicted flows
-
-    pbar = tqdm(total=len(val_loader))
-    for i_batch, data_blob in enumerate(val_loader):
-        image1, image2, flow_gt, valid = [x.cuda(non_blocking=True) for x in data_blob]
-        
-        output = model.calc_flow(image1, image2)  # predicted flow (e.g. shape [1, 2, H, W])
-        flow_pred = output['flow'][-1].detach().cpu()  # get final predicted flow from sequence
-
-        predicted_flows.append(flow_pred[0])  # remove batch dimension (1, 2, H, W) -> (2, H, W)
-
-        update_metrics(args, output, flow_gt, valid)
-        pbar.update(1)
-
-    pbar.close()
-
-    # Save predicted flows as .pt
-    save_path = Path(f"predicted_flows_chairs_val.pt")
-    torch.save(predicted_flows, save_path)
-
-
-
-def extract_keypoints(segmentation):
-    labels = torch.unique(segmentation)
-    keypoints = []
-    for label in labels:
-        if label == 0:
-            continue  
-        mask = (segmentation == label).cpu().numpy()
-        if np.sum(mask) == 0:
-            continue
-        cy, cx = center_of_mass(mask)
-        keypoints.append((int(cx), int(cy), int(label.item())))
-    return keypoints 
-
-def compute_sparse_flow(seg_start, seg_end):
-    kp_start = extract_keypoints(seg_start)
-    kp_end = extract_keypoints(seg_end)
-
-    end_dict = {label: (x, y) for x, y, label in kp_end}
-
-    flow_points = []
-    for x0, y0, label in kp_start:
-        if label in end_dict:
-            x1, y1 = end_dict[label]
-            flow_points.append((x0, y0, x1 - x0, y1 - y0)) 
-    return flow_points
-
-def evaluate_sparse_flow(flow_pred, sparse_flow_points):
-    epe_sum = 0
-    count = 0
-    H, W = flow_pred.shape[1:3]
-    for (x, y, dx, dy) in sparse_flow_points:
-        if 0 <= x < W and 0 <= y < H:
-            if flow_pred.ndim == 3:  # [C,H,W]
-                pred_flow = flow_pred[:, y, x].cpu().numpy()  # shape (2,)
-            else:  # [B,C,H,W]
-                pred_flow = flow_pred[0, :, y, x].cpu().numpy()
-            #pred_flow = flow_pred[0, :, y, x].cpu().numpy() 
-            gt_flow = np.array([dx, dy])
-            epe = np.linalg.norm(pred_flow - gt_flow)
-            epe_sum += epe
-            count += 1
-    if count == 0:
-        return None  
-    return epe_sum / count
-
-
-def warp_flow(flow, ref_flow):
-    # flow: [2, H, W] — the flow you want to warp
-    # ref_flow: [2, H, W] — the flow to warp with
-
-    B, H, W = 1, flow.shape[1], flow.shape[2]
-
-    # Build mesh grid
-    y, x = torch.meshgrid(
-        torch.arange(0, H, device=flow.device),
-        torch.arange(0, W, device=flow.device),
-        indexing="ij"
-    )
-    grid = torch.stack((x, y), dim=0).float()  # [2, H, W]
-
-    # Add ref_flow to grid => where to sample from
-    vgrid = grid + ref_flow  # [2, H, W]
-
-    # Normalize to [-1, 1] for grid_sample
-    vgrid[0] = 2.0 * vgrid[0] / (W - 1) - 1.0
-    vgrid[1] = 2.0 * vgrid[1] / (H - 1) - 1.0
-
-    vgrid = vgrid.permute(1, 2, 0).unsqueeze(0)  # [1, H, W, 2]
-
-    # flow to warp must be [B, C, H, W]
-    flow = flow.unsqueeze(0)  # [1, 2, H, W]
-
-    warped = F.grid_sample(flow, vgrid, mode='bilinear', padding_mode='border', align_corners=True)
-    return warped.squeeze(0)  # [2, H, W]
-
-@torch.no_grad()
-def validate_stir(args, model):
-    import cv2
-
-
-
-    val_dataset = STIR(root=args.dataset_root)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
-
-    val_epe_meter = AverageMeter()
-
-    #train_H, train_W = 432, 960
-    train_H, train_W = args.image_size
-
-    for i, (frames, seg_start, seg_end) in enumerate(val_loader):
-
-        frames = frames[0]  # Remove batch dim => [T, 3, H, W]
-
-        #T = frames.shape[0]
-        T, _, orig_H, orig_W = frames.shape
-
-        total_flow = None
-        all_flows = []
-
-        for t in range(T - 1):
-            frame1 = frames[t].unsqueeze(0).cuda(non_blocking=True) #frames[t].unsqueeze(0)
-            frame2 = frames[t + 1].unsqueeze(0).cuda(non_blocking=True) #frames[t + 1].unsqueeze(0)
-            
-            with torch.cuda.amp.autocast():
-                output = model.calc_flow(frame1, frame2)
-
-            flow_pred = output['flow'][-1].detach()
-
-            if 'var' in output:
-                var_pred = output['var'][-1].detach().cpu() 
-                var_pred = var_pred.squeeze().numpy()      
-            else:
-                var_pred = None
-
-            flow_pred_cpu = flow_pred.squeeze(0).cpu() 
-            all_flows.append(flow_pred_cpu)
-            total_flow = flow_pred_cpu
-
-            
-            if var_pred is not None:
-                var_norm = (var_pred - var_pred.min()) / (var_pred.max() - var_pred.min() + 1e-8)
-                var_heatmap = (255 * var_norm).astype(np.uint8)
-                var_heatmap = cv2.applyColorMap(var_heatmap, cv2.COLORMAP_JET)
-                cv2.imwrite(f"var_vis_batch{i}_t{t}.png", var_heatmap)
-            else:
-                print(f"[DEBUG] No variance output for batch {i}, t={t}")   
-
-            del frame1, frame2, output, flow_pred,  
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-
-        save_path = f"pred_flow_1908_{i}_new.pt"
-        torch.save(all_flows, save_path)
-        sparse_flow = compute_sparse_flow(seg_start[0], seg_end[0])
-        predicted_end_points = []
-        gt_end_points = []
-
-        H, W = all_flows[0].shape[1], all_flows[0].shape[2]
-
-        for (x, y, dx_gt, dy_gt) in sparse_flow:
-            x_pos = x
-            y_pos = y
-
-            # Follow flow through all frames to get predicted final position
-            for flow in all_flows:
-                u_map = flow[0]  # [H, W]
-                v_map = flow[1]
-                x_clamp = int(np.clip(x_pos, 0, W - 1))
-                y_clamp = int(np.clip(y_pos, 0, H - 1))
-                u = u_map[y_clamp, x_clamp].item()
-                v = v_map[y_clamp, x_clamp].item()
-                x_pos += u
-                y_pos += v
-
-            predicted_end_points.append([x_pos, y_pos])
-            # Ground truth end point:
-            gt_end_points.append([x + dx_gt, y + dy_gt])
-
-        predicted_end_points = np.array(predicted_end_points)
-        gt_end_points = np.array(gt_end_points)
-
-        # Compute End Point Error (EPE) per keypoint
-        errors = np.linalg.norm(predicted_end_points - gt_end_points, axis=1)
-        avg_epe = errors.mean()
-
-        pred_sparse_flow = []
-        for (x, y, dx, dy) in sparse_flow:
-            u = total_flow[0, y, x].item()
-            v = total_flow[1, y, x].item()
-            pred_sparse_flow.append([x, y, u, v])
-
-        pred_sparse_flow = torch.tensor(pred_sparse_flow, dtype=torch.float32)
-
-        epe = evaluate_sparse_flow(total_flow, sparse_flow)
-        if epe is not None:
-            val_epe_meter.update(epe, 1)
-
-    print(f"STIR Test EPE on sparse landmarks: {val_epe_meter.avg:.4f}")
-
-
-
-
-@torch.no_grad()
-def validate_test(args, model):
-    val_dataset = testvid(root=args.dataset_root)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
-    print('val loader: ',val_loader)
-    val_epe_meter = AverageMeter()
-    print(f"Loaded test test data: {len(val_loader)} samples")
-    for i, (frames) in enumerate(val_loader):
-        if i >= 4:
-            break
-
-        frames = frames[0] 
-        T = frames.shape[0]
-        total_flow = None
-        all_flows = []
-
-        for t in range(T - 1):
-            if t>= 100:
-                break
-            
-            frame1 = frames[t].unsqueeze(0).cuda(non_blocking=True) 
-            frame2 = frames[t + 1].unsqueeze(0).cuda(non_blocking=True) 
-
-            with torch.cuda.amp.autocast():
-                output = model.calc_flow(frame1, frame2)
-
-            flow_pred = output['flow'][-1].detach()
-
-            flow_pred_cpu = flow_pred.cpu()
-            all_flows.append(flow_pred_cpu)
-
-            if total_flow is None:
-                total_flow = flow_pred_cpu
-            else:
-                total_flow += flow_pred_cpu
-            del frame1, frame2, output, flow_pred, flow_pred_cpu
-
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-
-        #save_path = f"pred_flow_test_{i}.pt"
-        #torch.save(all_flows, save_path)
-
-
-        
-def eval(args):
-    args.gpus = [0]
-
-
-    model = fetch_model(args)
-    print(f"[DEBUG] fetch_model sees image_size={args.image_size}")
-
-    load_ckpt(model, args.ckpt)
-    model = model.cuda()
+# Reuse RAFT datasets + padder for consistency
+from MFT_WAFT.MFT.RAFT.core import datasets
+from MFT_WAFT.MFT.RAFT.core.utils.utils import InputPadder
+
+# --- small running-average helpers (like RAFT) ---
+class AverageMeter:
+    def __init__(self): self.reset()
+    def reset(self): self.sum = 0.0; self.n = 0
+    def update(self, val, cnt=1): self.sum += float(val) * cnt; self.n += cnt
+    @property
+    def avg(self): return self.sum / max(self.n, 1)
+
+val_epe  = AverageMeter()
+val_px1  = AverageMeter()
+val_px3  = AverageMeter()
+val_px5  = AverageMeter()
+val_fl   = AverageMeter()   # KITTI-style outlier
+val_unc  = AverageMeter()   # optional: mean uncertainty
+val_occ  = AverageMeter()   # optional: mean occlusion
+
+def _extract_ou_from_output(out_dict):
+    """
+    Extracts (unc, occ) tensors from WAFT-style outputs.
+    Handles:
+      - explicit heads: out_dict['uncertainty'] / out_dict['occlusion'] (lists)
+      - packed 'info': out_dict['info'] (lists of BxC×HxW, e.g. C=4 [unc, 0, 0, occ])
+    """
+    unc, occ = None, None
+
+    # --- Prefer explicit heads if available ---
+    if 'uncertainty' in out_dict and isinstance(out_dict['uncertainty'], list) and len(out_dict['uncertainty']) > 0:
+        unc = out_dict['uncertainty'][-1]  # Bx1xHxW
+    if 'occlusion' in out_dict and isinstance(out_dict['occlusion'], list) and len(out_dict['occlusion']) > 0:
+        occ = out_dict['occlusion'][-1]    # Bx2xHxW logits
+
+    # --- Fallback to packed info tensor ---
+    if (unc is None or occ is None) and ('info' in out_dict) and len(out_dict['info']) > 0:
+        info = out_dict['info'][-1]  # BxCxHxW
+        C = info.shape[1]
+        if unc is None and C >= 1:
+            unc = info[:, 0:1, ...]      # channel 0 → uncertainty
+        if occ is None:
+            if C == 4:
+                occ = info[:, 3:4, ...]  # WAFT_OU 4-channel layout
+            elif C >= 2:
+                occ = info[:, 1:2, ...]  # legacy 2-channel case
+
+    return unc, occ
+
+
+def _occl_accuracy_from_logits(occl_logits, occl_gt):
+    """
+    occl_logits: Bx2xHxW (class 1 = occluded)
+    occl_gt:     Bx1xHxW (0/1)
+    """
+    probs = occl_logits.softmax(dim=1)[:, 1:2, ...]  # P(occluded)
+    pred  = (probs > 0.5).float()
+    acc   = (pred == occl_gt).float().mean()
+    return float(acc)
+
+@no_grad()
+def validate_sintel(args, model, iters=12, quiet=False):
+    """Validation on Sintel (train split), RAFT-style API but WAFT outputs."""
     model.eval()
-    wrapped_model = InferenceWrapper(model, scale=args.scale, train_size=args.image_size, pad_to_train_size=False, tiling=False)
-    print(f"[DEBUG] InferenceWrapper train_size={wrapped_model.train_size}")
+    results = {}
+
+    for dstype in ['clean', 'final']:
+        # reset meters for this dstype
+        for m in [val_epe, val_px1, val_px3, val_px5, val_fl, val_unc, val_occ]:
+            m.reset()
+
+        val_dataset = datasets.MpiSintel(split='training', dstype=dstype, load_occlusion=False)
+        val_loader  = data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=False)
+
+        for data_blob in tqdm(val_loader, disable=quiet):
+            image1, image2, flow_gt, valid, occl_gt = [x.cuda(non_blocking=True) for x in data_blob]
+
+            padder = InputPadder(image1.shape)
+            image1, image2 = padder.pad(image1, image2)
+
+            # Forward — WAFT_OU returns dict with lists
+            out = model(image1, image2, iters=iters, test_mode=True)
+
+            flow_pred = out['flow'][-1]                    # Bx2xHxW
+            flow_pred = padder.unpad(flow_pred).cpu()
+            flow_gt   = flow_gt.cpu()
+            valid     = valid.cpu()
+
+            # === Flow metrics ===
+            epe = torch.sum((flow_pred - flow_gt) ** 2, dim=1).sqrt()  # [B,H,W]
+            mag = torch.sum(flow_gt ** 2, dim=1).sqrt()
+            val = (valid.squeeze(1) >= 0.5)                            # [B,H,W]
+
+            px1 = (epe < 1.0).float()
+            px3 = (epe < 3.0).float()
+            px5 = (epe < 5.0).float()
+            outlier = ((epe > 3.0) & ((epe / (mag + 1e-8)) > 0.05)).float()
+
+            # aggregate per-sample (batch=1 here)
+            val_epe.update(epe[val].mean().item(), 1)
+            val_px1.update(px1[val].mean().item(), 1)
+            val_px3.update(px3[val].mean().item(), 1)
+            val_px5.update(px5[val].mean().item(), 1)
+            val_fl.update(100.0 * outlier[val].mean().item(), 1)
+
+            # === Optional: uncertainty / occlusion monitoring ===
+            unc, occ = _extract_ou_from_output(out)
+
+            if unc is not None:
+                unc = padder.unpad(unc).cpu()
+                # log average predicted uncertainty on valid pixels
+                val_unc.update(unc[val.unsqueeze(1)].mean().item(), 1)
+
+            if occ is not None:
+                if occ.shape[1] == 2:
+                    # logits → accuracy vs occl_gt
+                    occl_gt = occl_gt.cpu()
+                    occ_unpad = padder.unpad(occ).cpu()
+                    acc = _occl_accuracy_from_logits(occ_unpad, occl_gt)
+                    val_occ.update(acc, 1)
+                else:
+                    # single-channel "occlusion score" — just log mean
+                    occ = padder.unpad(occ).cpu()
+                    val_occ.update(occ[val.unsqueeze(1)].mean().item(), 1)
+
+        # print + pack results
+        if not quiet:
+            print(f"Validation ({dstype}) EPE: {val_epe.avg:.4f}, 1px: {val_px1.avg:.4f}, 3px: {val_px3.avg:.4f}, 5px: {val_px5.avg:.4f}, F1: {val_fl.avg:.2f}")
+
+        results[f'eval/flow {dstype} EPE']  = val_epe.avg
+        results[f'eval/flow {dstype} 1px']  = val_px1.avg
+        results[f'eval/flow {dstype} 3px']  = val_px3.avg
+        results[f'eval/flow {dstype} 5px']  = val_px5.avg
+        results[f'eval/flow {dstype} F1']   = val_fl.avg
+
+        # only add if we actually saw these signals
+        if val_unc.n > 0: results[f'eval/uncertainty {dstype} mean'] = val_unc.avg
+        if val_occ.n > 0: results[f'eval/occlusion {dstype}']        = val_occ.avg
+
+    return results
 
 
-    with torch.no_grad():
-        if args.dataset == 'spring':
-            validate_spring(args, wrapped_model)
-        elif args.dataset == 'sintel':
-            validate_sintel(args, wrapped_model)
-        elif args.dataset == 'kitti':
-            validate_kitti(args, wrapped_model)
-        elif args.dataset == 'stir':
-            validate_stir(args, wrapped_model)
-        elif args.dataset == 'testvid':
-            validate_test(args, wrapped_model)
-        elif args.dataset == 'chairs':
-            validate_chairs(args, wrapped_model)
+@no_grad()
+def validate_kitti(args, model, iters=24):
+    """KITTI-2015 train split (same structure as RAFT)."""
+    model.eval()
+    val_dataset = datasets.KITTI(split='training')
 
+    epe_list, out_list = [], []
+    for idx in range(len(val_dataset)):
+        image1, image2, flow_gt, valid_gt, _ = val_dataset[idx]
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', help='experiment configure file name', required=True, type=str)
-    parser.add_argument('--ckpt', help='checkpoint path', required=True, type=str)
-    parser.add_argument('--dataset', help='dataset to evaluate on', choices=['sintel', 'kitti', 'spring', 'stir', 'testvid','chairs'], required=True, type=str)
-    parser.add_argument('--scale', help='scale factor for input images', default=0.0, type=float)
-    parser.add_argument('--dataset_root', help='root directory of the dataset', required=False, default=None, type=str)
-    args = parse_args(parser)
-    eval(args)
+        padder = InputPadder(image1.shape, mode='kitti')
+        image1, image2 = padder.pad(image1, image2)
 
-if __name__ == '__main__':
-    main()
+        out = model(image1, image2, iters=iters, test_mode=True)
+        flow = padder.unpad(out['flow'][-1]).cpu()
+
+        epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
+        mag = torch.sum(flow_gt**2, dim=0).sqrt()
+
+        epe = epe.view(-1)
+        mag = mag.view(-1)
+        val = (valid_gt.view(-1) >= 0.5)
+
+        outlier = ((epe > 3.0) & ((epe / (mag + 1e-8)) > 0.05)).float()
+        epe_list.append(epe[val].mean().item())
+        out_list.append(outlier[val].cpu().numpy())
+
+    epe = float(np.mean(epe_list))
+    f1  = 100.0 * float(np.mean(np.concatenate(out_list)))
+    print(f"Validation KITTI: EPE={epe:.4f}, F1={f1:.2f}")
+    return {'kitti-epe': epe, 'kitti-f1': f1}

@@ -12,8 +12,8 @@ from tqdm import tqdm
 from glob import glob
 import os.path as osp
 
-from utils import frame_utils
-from dataloader.augmentor import FlowAugmentor
+from MFT_WAFT.MFT.WAFT.utils import frame_utils
+from MFT_WAFT.MFT.WAFT.dataloader.augmentor import FlowAugmentor
 
 class FlowDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False):

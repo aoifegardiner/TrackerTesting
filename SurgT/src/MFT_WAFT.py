@@ -19,10 +19,10 @@ class MFTWAFTTrackerSurgT:
     """
 
     def __init__(self, im1, im2, bbox1_gt=None, bbox2_gt=None, steps=5):
+        print("Calling load_config with:", CONFIG)
         cfg = load_config(CONFIG)
-        
+        print("Loaded config:", cfg)
 
-        
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Two **independent** WAFT trackers so their prev_frame states don’t collide
