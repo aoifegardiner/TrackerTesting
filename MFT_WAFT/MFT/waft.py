@@ -37,7 +37,7 @@ import torch.nn.functional as F
 import numpy as np
 
 class FlowOUTrackingResult:
-    def __init__(self, flow, occlusion, sigma=None):
+    def __init__(self, flow, occlusion, sigma):
         """
         Container for flow outputs from RAFT or WAFT.
 
@@ -48,7 +48,7 @@ class FlowOUTrackingResult:
         """
         self.flow = flow
         self.occlusion = occlusion
-        self.sigma = sigma if sigma is not None else torch.zeros_like(occlusion)
+        self.sigma = sigma #if sigma is not None else torch.zeros_like(occlusion)
 
     def to(self, device):
         """Move all tensors to the given device."""
@@ -79,7 +79,7 @@ class FlowOUTrackingResult:
         return FlowOUTrackingResult(
             self.flow.clone(),
             self.occlusion.clone(),
-            self.sigma.clone() if self.sigma is not None else None
+            self.sigma.clone()
         )
 
     def cpu(self):
@@ -274,6 +274,7 @@ class WAFTWrapper:
 
         # Compute flow and extra outputs (occlusion + sigma)
         flow, extra = self.compute_flow(self.prev_frame, frame)
+        
 
         occlusion = extra.get('occlusion', None)
         sigma = extra.get('sigma', None)
@@ -329,7 +330,6 @@ class WAFTWrapper:
 
         # --- inputs are BGR uint8 (H,W,3) per MFT contract ---
         H, W = im1.shape[:2]
-
         # to CHW RGB float32 torch
         image1 = einops.rearrange(
             torch.from_numpy(im1[:, :, ::-1].copy()),  # BGR→RGB
@@ -337,7 +337,7 @@ class WAFTWrapper:
         image2 = einops.rearrange(
             torch.from_numpy(im2[:, :, ::-1].copy()),
             "H W C -> 1 C H W", C=3).float().to(self.device)
-
+        
         with torch.no_grad():
             out = self.model.calc_flow(image1, image2)
 

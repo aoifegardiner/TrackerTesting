@@ -13,9 +13,9 @@
 
 
 from .vitwarp_v8 import ViTWarpV8
-from .waft_ou import WAFT_OU
+from .waft_ou import WAFT_OU_FromFlow
 
 def fetch_model(args):
     base_model = ViTWarpV8(args)
-    wrapped = WAFT_OU(base_model, args)
+    wrapped = WAFT_OU_FromFlow(base_model, args)
     return wrapped

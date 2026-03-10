@@ -25,6 +25,7 @@ def get_config(package_file, image_size_override=None):
     conf.flow_config = flow_conf
 
     conf.deltas = [np.inf, 1, 2, 4, 8, 16, 32]
+    #conf.deltas = [np.inf]
     conf.occlusion_threshold = 0.02
     conf.name = Path(__file__).stem
 

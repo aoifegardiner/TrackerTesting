@@ -1,6 +1,7 @@
 # -*- origami-fold-style: triple-braces -*-
 # Data loading based on https://github.com/NVIDIA/flownet2-pytorch
 import copy
+from tkinter import Image
 
 import numpy as np
 import torch
@@ -21,6 +22,9 @@ from pathlib import Path
 import einops
 import cv2
 #from ipdb import iex
+
+import PIL
+from PIL import Image as PILImage
 
 
 # flow is encoded with sign, so 2**15, occlusion and uncertainty without sign, so 2**16:
@@ -61,6 +65,8 @@ def read_flowou_png(path):
 
 
 class FlowDataset(data.Dataset):
+
+
     def __init__(self, aug_params=None, sparse=False, load_occlusion=False, root=None):
         self.root = root
         self.augmentor = None
@@ -93,6 +99,13 @@ class FlowDataset(data.Dataset):
             return occl / 255.0
         else:
             return occl
+        
+    @staticmethod
+    def safe_read_image(path: str):
+        with PILImage.open(path) as im:
+            im.load()                 # forces decode now (catches broken PNGs here)
+            return im.convert("RGB")  # always 3-channel
+
 
 #    #@iex
 #    def __getitem__(self, index):
@@ -191,15 +204,44 @@ class FlowDataset(data.Dataset):
         """
         index = index % len(self.image_list)
 
+        def _safe_png_rgb(path: str):
+                        # import inside to avoid any name collisions with Image
+                        from PIL import Image as PILImage, ImageFile
+                        ImageFile.LOAD_TRUNCATED_IMAGES = False  # keep strict; we want to skip broken files
+                        with PILImage.open(path) as im:
+                            im.load()                 # force decode here -> catches broken PNGs
+                            return np.array(im.convert("RGB"), dtype=np.uint8)
+        def _safe_png_mask(path: str):
+            from PIL import Image as PILImage, ImageFile
+            ImageFile.LOAD_TRUNCATED_IMAGES = False
+            with PILImage.open(path) as im:
+                im.load()
+                return np.array(im, dtype=np.float32)
         # ===============================
         # try to load safely
         # ===============================
         try:
             if self.is_test:
-                img1 = frame_utils.read_gen(self.image_list[index][0])
-                img2 = frame_utils.read_gen(self.image_list[index][1])
-                img1 = np.array(img1).astype(np.uint8)[..., :3]
-                img2 = np.array(img2).astype(np.uint8)[..., :3]
+                try:
+                    im1_path, im2_path = self.image_list[index]
+                    print("IMG1:", im1_path)
+                    print("IMG2:", im2_path)
+
+                    img1 = _safe_png_rgb(self.image_list[index][0])
+                    img2 = _safe_png_rgb(self.image_list[index][1])
+
+
+                    #img1 = np.array(img1).astype(np.uint8)
+                    #img2 = np.array(img2).astype(np.uint8)
+
+                except Exception as e:
+                    print(f"[WARN] Skipping index {index} due to image read error: {e}")
+                    return self.__getitem__((index + 1) % len(self))
+
+                #img1 = frame_utils.read_gen(self.image_list[index][0])
+                #img2 = frame_utils.read_gen(self.image_list[index][1])
+                #img1 = np.array(img1).astype(np.uint8)[..., :3]
+                #img2 = np.array(img2).astype(np.uint8)[..., :3]
                 img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W').float()
                 img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W').float()
                 return img1, img2, self.extra_info[index]
@@ -211,7 +253,8 @@ class FlowDataset(data.Dataset):
                     np.random.seed(np.random.randint(0, 1024) + worker_info.id)
                     random.seed(np.random.randint(0, 1024) + worker_info.id)
                     self.init_seed = True
-
+            flow_path = self.flow_list[index]
+            print("FLOW PATH:", flow_path)
             valid = None
             if self.sparse:
                 flow, valid = frame_utils.read_gen_sparse_flow(self.flow_list[index])
@@ -219,8 +262,9 @@ class FlowDataset(data.Dataset):
             else:
                 flow = frame_utils.read_gen(self.flow_list[index])
 
-            img1 = frame_utils.read_gen(self.image_list[index][0])
-            img2 = frame_utils.read_gen(self.image_list[index][1])
+            img1 = _safe_png_rgb(self.image_list[index][0])
+            img2 = _safe_png_rgb(self.image_list[index][1])
+
 
         except Exception as e:
             print(f"[WARN] Skipping index {index} due to read error: {e}")
@@ -242,8 +286,10 @@ class FlowDataset(data.Dataset):
 
         if self.load_occlusion:
             try:
-                occl = frame_utils.read_gen(self.occlusion_list[index])
-                occl = np.array(occl).astype(np.float32)
+                #occl = frame_utils.read_gen(self.occlusion_list[index])
+                #occl = np.array(occl).astype(np.float32)
+                #occl = self.normalise_occlusions_01(occl)
+                occl = _safe_png_mask(self.occlusion_list[index])
                 occl = self.normalise_occlusions_01(occl)
             except Exception as e:
                 print(f"[WARN] Skipping occlusion for index {index} due to error: {e}")
@@ -258,14 +304,25 @@ class FlowDataset(data.Dataset):
         else:
             occl = occl[:, :, 0:1]
 
+        
+        mag_before = np.linalg.norm(flow, axis=2).mean()
+        img1_b = img1.shape
+
         # data augmentation
         if self.augmentor is not None:
             img1, img2, flow, valid, occl = self.augmentor(img1, img2, flow, valid, occl)
+
+        mag_after = np.linalg.norm(flow, axis=2).mean()
+        img1_a = img1.shape
+
+        print("img shape", img1_b, "->", img1_a, "flow mean mag", mag_before, "->", mag_after)
+
 
         img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W').float()
         img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W').float()
         flow = einops.rearrange(torch.from_numpy(flow), 'H W xy -> xy H W').float()
         occl = einops.rearrange(torch.from_numpy(occl), 'H W 1 -> 1 H W').float()
+
 
         if valid is not None:
             valid = einops.rearrange(torch.from_numpy(valid), 'H W 1 -> 1 H W') > 0.99
@@ -274,6 +331,93 @@ class FlowDataset(data.Dataset):
             valid = einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
 
         return img1, img2, flow, valid.float(), occl
+    
+#    def __getitem__(self, index):
+#        index = index % len(self.image_list)
+#
+#        try:
+#            # ---- flow ----
+#            if self.sparse:
+#                flow, valid = frame_utils.read_gen_sparse_flow(self.flow_list[index])
+#                valid = einops.rearrange(valid, 'H W -> H W 1')
+#            else:
+#                flow = frame_utils.read_gen(self.flow_list[index])
+#                valid = None
+#            flow = np.array(flow).astype(np.float32)
+#
+#            # ---- images ----
+#            im1_path, im2_path = self.image_list[index]
+#            #img1 = self.safe_read_image(im1_path)
+#            #img2 = self.safe_read_image(im2_path)
+#
+#            img1 = np.array(self.safe_read_image(self.image_list[index][0]), dtype=np.uint8)
+#            img2 = np.array(self.safe_read_image(self.image_list[index][1]), dtype=np.uint8)
+#
+#
+#            # handle grayscale
+#            if img1.ndim == 2:
+#                img1 = np.repeat(img1[..., None], 3, axis=2)
+#                img2 = np.repeat(img2[..., None], 3, axis=2)
+#            else:
+#                img1 = img1[..., :3]
+#                img2 = img2[..., :3]
+#
+#            # ---- occlusion ----
+#            if self.load_occlusion:
+#                occl_path = self.occlusion_list[index]
+#                occl_im = Image.open(occl_path); occl_im.load()
+#                occl = np.array(occl_im).astype(np.float32)
+#                occl = self.normalise_occlusions_01(occl)
+#            else:
+#                H, W, _ = img1.shape
+#                occl = np.zeros((H, W, 1), np.float32)
+#
+#            if occl.ndim == 2:
+#                occl = occl[..., None]
+#            else:
+#                occl = occl[..., :1]
+#
+#            # ---- augmentation ----
+#            if self.augmentor is not None:
+#                img1, img2, flow, valid, occl = self.augmentor(img1, img2, flow, valid, occl)
+#
+#            # ---- to torch ----
+#            img1 = einops.rearrange(torch.from_numpy(img1), 'H W C -> C H W').float()
+#            img2 = einops.rearrange(torch.from_numpy(img2), 'H W C -> C H W').float()
+#            flow = einops.rearrange(torch.from_numpy(flow), 'H W xy -> xy H W').float()
+#            occl = einops.rearrange(torch.from_numpy(occl), 'H W 1 -> 1 H W').float()
+#
+#            if valid is not None:
+#                valid = einops.rearrange(torch.from_numpy(valid), 'H W 1 -> 1 H W') > 0.99
+#                valid = valid & einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
+#            else:
+#                valid = einops.rearrange(torch.all(flow.abs() < 1000, dim=0), 'H W -> 1 H W')
+#
+#            return img1, img2, flow, valid.float(), occl
+#
+#        except Exception as e:
+#            # IMPORTANT: print paths so you can confirm what's corrupt
+#            try:
+#                im1_path, im2_path = self.image_list[index]
+#                flow_path = self.flow_list[index]
+#                occl_path = self.occlusion_list[index] if self.load_occlusion else None
+#            except Exception:
+#                im1_path = im2_path = flow_path = occl_path = "<?>"
+#
+#            print(f"[SKIP] idx={index} error={repr(e)}")
+#            print(f"       im1={im1_path}")
+#            print(f"       im2={im2_path}")
+#            print(f"       flow={flow_path}")
+#            if not hasattr(self, "_skip_count"):
+#                self._skip_count = 0
+#            self._skip_count += 1
+#            if self._skip_count % 50 == 0:
+#                print(f"[SKIP] total skipped so far: {self._skip_count}")
+#
+#            if occl_path is not None:
+#                print(f"       occl={occl_path}")
+#
+#            return None
 
 
     def __rmul__(self, v):
@@ -514,7 +658,7 @@ class MpiSintel(FlowDataset):
         if not self.load_cache(self.save_file_path):
             self.logger.warning(f"Could not load cache from {self.save_file_path}")
             flow_root = osp.join(root, split, 'flow')
-            occl_root = osp.join(root, split, 'occlusions_rev')
+            occl_root = osp.join(root, split, 'occlusions')
             image_root = osp.join(root, split, dstype)
 
             for scene in os.listdir(image_root):
@@ -671,6 +815,11 @@ class HD1K(FlowDataset):
 
             seq_ix += 1
 
+def collate_drop_none(batch):
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+    return torch.utils.data.dataloader.default_collate(batch)
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
     """ Create the data loader for the corresponding training set """
@@ -690,7 +839,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
         train_dataset = FlyingChairs(aug_params, split='training')
 
     elif args.stage == 'things':
-        aug_params.update({'crop_size': args.image_size, 'min_scale': -0.4, 'max_scale': 0.8, 'do_flip': True})
+        aug_params.update({'crop_size': args.image_size, 'min_scale': 0.0, 'max_scale': 0.0, 'do_flip': True, 'spatial_aug_prob': 0.0})
         clean_dataset = FlyingThings3D(aug_params, dstype='frames_cleanpass', load_occlusion=load_occlusion)
         final_dataset = FlyingThings3D(aug_params, dstype='frames_finalpass', load_occlusion=load_occlusion)
         train_dataset = clean_dataset + final_dataset
@@ -758,7 +907,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
 
     shuffle = not getattr(args, 'no_shuffle', False)
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
-                                   pin_memory=False, shuffle=shuffle, num_workers=num_workers, drop_last=True)
+                                   pin_memory=False, shuffle=shuffle, num_workers=num_workers, drop_last=True, collate_fn=collate_drop_none)
 
     print('Training with %d image pairs' % len(train_dataset))
     return train_loader

@@ -1,10 +1,16 @@
 # -*- origami-fold-style: triple-braces; coding: utf-8; -*-
+import sys
+sys.path.insert(0, "/Workspace/agardiner_STIR_submission/MFT_WAFT")  # directory that contains the MFT/ package
+
 import einops
 import numpy as np
 import torch
 from types import SimpleNamespace
 import logging
-from MFT_WAFT.MFT.waft  import FlowOUTrackingResult as FlowOUTrackingResult
+#from MFT_WAFT.MFT.waft  import FlowOUTrackingResult as FlowOUTrackingResult
+from MFT_WAFT.MFT.results import FlowOUTrackingResult
+
+
 from MFT_WAFT.MFT.utils.timing import general_time_measurer
 
 logger = logging.getLogger(__name__)
@@ -29,15 +35,56 @@ def flow_to_color(flow, max_flow=None):
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return bgr
 
+import torch
+from pathlib import Path
+
+class DiskFlowCache:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, left_id, right_id):
+        return self.root / f"{left_id:06d}_{right_id:06d}.pt"
+
+    def write(self, left_id, right_id, flow, occ, sigma):
+        path = self._path(left_id, right_id)
+
+        torch.save({
+            "flow": flow.detach().cpu(),
+            "occlusion": occ.detach().cpu(),
+            "sigma": sigma.detach().cpu(),
+        }, path)
+
+    def read(self, left_id, right_id, device=None):
+        path = self._path(left_id, right_id)
+        if not path.exists():
+            raise FileNotFoundError
+
+        data = torch.load(path, map_location="cpu")
+
+        flow = data["flow"].float()
+        occ = data["occlusion"].float()
+        sig = data["sigma"].float()
+
+        if device is not None:
+            flow = flow.to(device)
+            occ  = occ.to(device)
+            sig  = sig.to(device)
+
+        return flow, occ, sig
 
 
 class MFT():
     def __init__(self, config):
+        
         """Create MFT tracker
         args:
           config: a MFT.config.Config, for example from configs/MFT_cfg.py"""
         self.C = config   # must be named self.C, will be monkeypatched!
         self.flower = config.flow_config.of_class(config.flow_config)  # init the OF
+        import inspect
+        print("flower type:", type(self.flower))
+        print("flower file:", inspect.getfile(type(self.flower)))
         self.device = 'cuda'
 
     def init(self, img, start_frame_i=0, time_direction=1, flow_cache=None, **kwargs):
@@ -53,12 +100,14 @@ class MFT():
         returns:
           meta: initial frame result container, with initial (zero-motion) MFT.results.FlowOUTrackingResult in meta.result 
         """
+        print("Starting MFT track")
         self.img_H, self.img_W = img.shape[:2]
         self.start_frame_i = start_frame_i
         self.current_frame_i = self.start_frame_i
         assert time_direction in [+1, -1]
         self.time_direction = time_direction
-        self.flow_cache = flow_cache
+        self.flow_cache = flow_cache or DiskFlowCache("./flow_cache_MFT_Stir")
+        #self.flow_cache = flow_cache
 
         self.memory = {
             self.start_frame_i: {
@@ -88,7 +137,7 @@ class MFT():
         """
         meta = SimpleNamespace()
         self.current_frame_i += self.time_direction
-
+        #print("Startig MFT track")
         # OF(init, t) candidates using different deltas
         delta_results = {}
         already_used_left_ids = []
@@ -120,12 +169,29 @@ class MFT():
 
             flow_init = None
             use_cache = np.isfinite(delta) or self.C.cache_delta_infinity
+            cache = DiskFlowCache("./flow_cache_MFT_Stir")
             left_to_right = get_flowou_with_cache(self.flower, left_img, right_img, flow_init,
-                                                  self.flow_cache, left_id, right_id,
-                                                  read_cache=use_cache, write_cache=use_cache)
+                                                  cache=cache, left_id=left_id, right_id=right_id,
+                                                  read_cache=True, write_cache=True)
 
             chain_timer.start()
             delta_results[delta] = chain_results(template_to_left, left_to_right)
+
+            def mean1(x): 
+                return x.mean().item()
+            
+            chained = chain_results(template_to_left, left_to_right)
+            delta_results[delta] = chained
+            
+            print(
+                f"delta={delta} left_id={left_id} | "
+                f"sigma(init->left)={mean1(template_to_left.sigma):.3f}  "
+                f"sigma(left->right)={mean1(left_to_right.sigma):.3f}  "
+                f"sigma(chained)={mean1(chained.sigma):.3f}  "
+                f"occ(edge)={mean1(left_to_right.occlusion):.3f}"
+            )
+
+
             already_used_left_ids.append(left_id)
             chain_timer.stop()
 
@@ -140,24 +206,19 @@ class MFT():
         all_sigmas = torch.stack([result.sigma for result in all_results], dim=0)  # (N_delta, 1, H, W)
         all_occlusions = torch.stack([result.occlusion for result in all_results], dim=0)  # (N_delta, 1, H, W)
 
+
         #scores = -all_sigmas
         #scores[all_occlusions > self.C.occlusion_threshold] = -float('inf')
 
-        sigma_norm = all_sigmas / (all_sigmas.mean(dim=0, keepdim=True) + 1e-6)
-        scores = -sigma_norm
-        scores[all_occlusions > self.C.occlusion_threshold] = -float('inf')
+#        sigma_norm = all_sigmas / (all_sigmas.mean(dim=0, keepdim=True) + 1e-6)
+#        scores = -sigma_norm
+#        scores[all_occlusions > self.C.occlusion_threshold] = -float('inf')
 
 
+        scores = -all_sigmas
+        #scores[all_occlusions > self.C.occlusion_threshold] = -float('inf')
         best = scores.max(dim=0, keepdim=True)
         selected_delta_i = best.indices  # (1, 1, H, W)
-
-        if 450 <= self.current_frame_i <= 550:
-            used_deltas = sorted(list(delta_results.keys()), key=lambda delta: 0 if np.isinf(delta) else delta)
-            print(f"[DEBUG TRACK] Frame {self.current_frame_i}: "
-                  f"Selected delta idx mean={selected_delta_i.float().mean():.2f}, "
-                  f"Deltas={used_deltas}")
-        
-
         best_flow = all_flows.gather(dim=0,
                                      index=einops.repeat(selected_delta_i,
                                                          'N_delta 1 H W -> N_delta xy H W',
@@ -176,6 +237,21 @@ class MFT():
         result.occlusion[invalid_mask] = 1
         selection_timer.report()
 
+        meta.selected_delta_i = selected_delta_i.detach().cpu()   # int64
+        meta.used_deltas = used_deltas 
+
+        if getattr(self.C, "store_delta_value_map", False):
+            # build lookup as float tensor
+            # represent inf as a large sentinel or np.inf (torch supports inf in float)
+            lookup = torch.tensor(
+                [float(d) if np.isfinite(d) else float("inf") for d in used_deltas],
+                device=selected_delta_i.device,
+                dtype=torch.float32
+            )  # (D,)
+            delta_value_map = lookup[selected_delta_i.squeeze(0).squeeze(0)]  # (H,W)
+            meta.delta_value_map = delta_value_map.detach().cpu()             # (H,W)
+
+    
         out_result = result.clone()
             
         meta.result = out_result
@@ -222,7 +298,8 @@ class MFT():
 # @profile
 def get_flowou_with_cache(flower, left_img, right_img, flow_init=None,
                           cache=None, left_id=None, right_id=None,
-                          read_cache=False, write_cache=False):
+                          read_cache=False, write_cache=False, 
+                          compose_on_miss=True):
     """Compute flow from left_img to right_img. Possibly with caching.
 
     Returns:
@@ -230,90 +307,62 @@ def get_flowou_with_cache(flower, left_img, right_img, flow_init=None,
     """
     import os, cv2, numpy as np, torch
 
-    must_compute = not read_cache
-    flow_left_to_right = occlusions = sigmas = None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _to_device_f32(flow, occ, sig):
+        return flow.float().to(device), occ.float().to(device), sig.float().to(device)
+
+
+#    must_compute = not read_cache
+#    flow_left_to_right = occlusions = sigmas = None
 
     # Try reading from cache if allowed
-    if read_cache and flow_init is None:
-        assert left_id is not None and right_id is not None
+    if read_cache and flow_init is None and cache is not None:
         try:
-            assert cache is not None
-            flow_left_to_right, occlusions, sigmas = cache.read(left_id, right_id)
-            assert flow_left_to_right is not None
-            must_compute = False
+            flow_left_to_right, occlusions, sigmas = cache.read(left_id, right_id, device=device)
+            flow_left_to_right, occlusions, sigmas = _to_device_f32(flow_left_to_right, occlusions, sigmas)
+            print(f"[CACHE HIT] {left_id}->{right_id}")
+            return FlowOUTrackingResult(flow_left_to_right, occlusions, sigmas)
         except Exception:
-            must_compute = True
+            print(f"[CACHE MISS] {left_id}->{right_id}")
 
-    # === Compute flow if needed ===
-    if must_compute:
-        debug_dir = "./debug_flows_raw_left"
-        os.makedirs(debug_dir, exist_ok=True)
+    
+#    if compose_on_miss and read_cache and flow_init is None and cache is not None:
+#        if left_id is not None and right_id is not None and right_id > left_id:
+#            try:
+#                # first edge
+#                f, o, s = cache.read(left_id, left_id + 1, device=device)
+#                f, o, s = _to_device_f32(f, o, s)
+#                composed = FlowOUTrackingResult(f, o, s)
+#
+#                # chain remaining edges
+#                for k in range(left_id + 1, right_id):
+#                    f, o, s = cache.read(k, k + 1, device=device)
+#                    f, o, s = _to_device_f32(f, o, s)
+#                    edge = FlowOUTrackingResult(f, o, s)
+#                    composed = chain_results(composed, edge)
+#
+#                print(f"[CACHE COMPOSED] {left_id}->{right_id} from edges")
+#                return composed
+#            except Exception:
+#                # fall through to compute
+#                pass
 
-        # --- Load the original raw frames from video ---
-        video_path = "/Workspace/agardiner_STIR_submission/SurgT/data/test/case_1/1/video.mp4"
-        cap = cv2.VideoCapture(video_path)
+    flow, extra = flower.compute_flow(left_img, right_img, mode="flow")
+    occ = extra["occlusion"]
+    sig = extra["sigma"]
 
-        def read_frame(cap, idx):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError(f"Could not read frame {idx} from {video_path}")
-            return frame
+    # IMPORTANT: make sure these are float32 on CUDA for chaining
+    flow = flow.float().to(device)
+    occ  = occ.float().to(device)
+    sig  = sig.float().to(device)
 
-        def extract_left_view(frame):
-            """Extract the top half (LEFT camera) from vertically stacked stereo frame."""
-            H = frame.shape[0] // 2
-            return frame[:H, :]
+    # ---- 4) Write only consecutive to disk (half precision to save space)
+    if cache is not None and write_cache and flow_init is None:
+        if right_id == left_id + 1:
+            cache.write(left_id, right_id, flow.half().cpu(), occ.half().cpu(), sig.half().cpu())
 
-        # Read and extract top (LEFT) view
-        frame_left = extract_left_view(read_frame(cap, left_id))
-        frame_right = extract_left_view(read_frame(cap, right_id))
-        cap.release()
-
-        # Save clean left-only frames
-        cv2.imwrite(os.path.join(debug_dir, f"left_{left_id:04d}.png"), frame_left)
-        cv2.imwrite(os.path.join(debug_dir, f"left_{right_id:04d}.png"), frame_right)
-
-        # === Compute WAFT flow ===
-        flow_left_to_right, extra = flower.compute_flow(frame_left, frame_right, mode='flow')
-        occlusions = extra["occlusion"]
-        sigmas = extra["sigma"]
-
-        # --- Debug diagnostics ---
-        if 450 <= right_id <= 550:
-            flow_mag = torch.norm(flow_left_to_right, dim=0)
-            mean_flow = flow_mag.mean().item()
-            max_flow = flow_mag.max().item()
-            sigma_mean = sigmas.mean().item()
-            occl_mean = occlusions.mean().item()
-            print(f"[DEBUG FLOW] Frame {right_id:03d}: "
-                  f"Flow mean={mean_flow:.3f}, max={max_flow:.3f}, "
-                  f"σ_mean={sigma_mean:.3f}, occ_mean={occl_mean:.3f}")
-
-        # === Save visualization ===
-        def flow_to_hsv(flow_np):
-            fx, fy = flow_np[0], flow_np[1]
-            mag, ang = cv2.cartToPolar(fx, fy)
-            hsv = np.zeros((flow_np.shape[1], flow_np.shape[2], 3), dtype=np.uint8)
-            hsv[..., 0] = ang * 180 / np.pi / 2
-            hsv[..., 1] = 255
-            hsv[..., 2] = np.clip((mag / (mag.max() + 1e-6)) * 255, 0, 255)
-            return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-        flow_vis = flow_to_hsv(flow_left_to_right.detach().cpu().numpy())
-        cv2.imwrite(os.path.join(debug_dir, f"flow_left_{right_id:04d}.png"), flow_vis)
-
-    # === Write to cache if requested ===
-    if cache is not None and write_cache and must_compute and (flow_init is None):
-        cache.write(left_id, right_id, flow_left_to_right, occlusions, sigmas)
-
-    # === Wrap into FlowOUTrackingResult ===
-    flowou = FlowOUTrackingResult(flow_left_to_right, occlusions, sigmas)
-
-    print(f"[FLOW CACHE CHECK] Returning flow {tuple(flow_left_to_right.shape)}, "
-      f"σ_mean={sigmas.mean():.4f}, occ_mean={occlusions.mean():.4f}")
-
-    return flowou
+    return FlowOUTrackingResult(flow, occ, sig)
 
 
 def chain_results(left_result, right_result):

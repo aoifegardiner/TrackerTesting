@@ -3,11 +3,11 @@ import torch.nn.functional as F
 import einops
 import logging
 
-from MFT.utils.geom_utils import torch_get_featuremap_coords, get_featuremap_coords
-from MFT.utils.misc import ensure_numpy
+from MFT_WAFT.MFT.utils.geom_utils import torch_get_featuremap_coords, get_featuremap_coords
+from MFT_WAFT.MFT.utils.misc import ensure_numpy
 
-from MFT.RAFT.core.raft import RAFT  # noqa: E402
-from MFT.RAFT.core.utils.utils import InputPadder  # noqa: E402
+from MFT_WAFT.MFT.RAFT.core.raft import RAFT  # noqa: E402
+from MFT_WAFT.MFT.RAFT.core.utils.utils import InputPadder  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ class RAFTWrapper():
     def __init__(self, config):
         device = 'cuda'
         self.C = config
-
+        print("Initializing RAFTWrapper")
         model = torch.nn.DataParallel(RAFT(self.C.raft_params))
         model.load_state_dict(torch.load(self.C.model, map_location='cpu'))
 
@@ -60,6 +60,15 @@ class RAFTWrapper():
         occlusions = torch.squeeze(padder.unpad(all_predictions['occlusion'].softmax(dim=1)[:, 1:2, :, :]), dim=0)
         uncertainty_pred = torch.squeeze(padder.unpad(all_predictions['uncertainty']), dim=0)
         sigma = torch.sqrt(torch.exp(uncertainty_pred))
+        # --- CONSTANT UNCERTAINTY ---
+#        SIGMA_CONST = 100  # <-- choose your constant value
+#        
+#        sigma = torch.full(
+#            (1, H, W),
+#            fill_value=SIGMA_CONST,
+#            device=flow.device,
+#            dtype=flow.dtype
+#        )
 
         if mode == 'flow':
             if numpy_out:

@@ -82,11 +82,11 @@ if __name__ == '__main__':
     model = VisionTransformer('vitt', 95)
     input = torch.randn(1, 95, 512, 768)
     output = model(input)
-    print(output['out'].shape)
-    print(output['path_1'].shape)
-    print(output['path_2'].shape)
-    print(output['path_3'].shape)
-    print(output['path_4'].shape)
+    #print(output['out'].shape)
+    #print(output['path_1'].shape)
+    #print(output['path_2'].shape)
+    #print(output['path_3'].shape)
+    #print(output['path_4'].shape)
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,

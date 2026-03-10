@@ -2,10 +2,10 @@ import einops
 import numpy as np
 import torch
 import torch.nn.functional as F
-from MFT.utils import interpolation
-from MFT.utils.geom_utils import torch_get_featuremap_coords
-from MFT.utils.misc import ensure_torch, ensure_numpy
-import MFT.utils.io as io_utils
+from MFT_WAFT.MFT.utils import interpolation
+from MFT_WAFT.MFT.utils.geom_utils import torch_get_featuremap_coords
+from MFT_WAFT.MFT.utils.misc import ensure_torch, ensure_numpy
+import MFT_WAFT.MFT.utils.io as io_utils
 
 
 class FlowOUTrackingResult(object):

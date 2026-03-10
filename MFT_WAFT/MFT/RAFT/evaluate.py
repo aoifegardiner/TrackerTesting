@@ -130,7 +130,7 @@ def validate_sintel(model, iters=12, n_val=None, subsplit=None, quiet=False):
     model.eval()
     results = {}
     for dstype in ['clean', 'final']:
-        val_dataset = datasets.MpiSintel(split='training', dstype=dstype, subsplit=subsplit, load_occlusion=True)
+        val_dataset = datasets.MpiSintel(split='training', dstype=dstype, subsplit=subsplit, load_occlusion=False)
         epe_list = []
         uncer_loss_list = []
         occl_loss_list = []

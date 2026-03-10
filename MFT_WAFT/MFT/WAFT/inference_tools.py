@@ -34,6 +34,26 @@ def generate_gaussian(size, sigma):
     gaussian = torch.exp(-distance_squared / (2 * sigma ** 2))
     return gaussian
 
+def _unwrap_tensor(x):
+    # Peel off list/tuple wrappers until we hit a tensor (or give up)
+    while isinstance(x, (list, tuple)):
+        if len(x) == 0:
+            return None
+        x = x[0]
+    return x if torch.is_tensor(x) else None
+
+def _storage_ptr(x) -> int:
+    t = _unwrap_tensor(x)
+    if t is None:
+        return -1  # indicates "not a tensor"
+    try:
+        return t.untyped_storage().data_ptr()  # newer torch
+    except Exception:
+        try:
+            return t.storage().data_ptr()       # older torch
+        except Exception:
+            return t.data_ptr()
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self):
@@ -54,8 +74,12 @@ class InferenceWrapper(object):
         self.model = model
         self.train_size = train_size
         self.scale = scale
-        self.pad_to_train_size = pad_to_train_size
-        self.tiling = tiling
+        #self.pad_to_train_size = pad_to_train_size
+        #self.tiling = tiling
+        self.pad_to_train_size = False
+        self.tiling = False
+        
+        
 
     def inference_padding(self, image):
         h, w = self.train_size
@@ -76,33 +100,140 @@ class InferenceWrapper(object):
             image1_ij = image1[:, :, hl: hr, wl: wr]
             image2_ij = image2[:, :, hl: hr, wl: wr]
             output_ij = self.model(image1_ij, image2_ij)
-            valid[:, hl: hr, wl: wr] += weight
+
+            def _get0(key):
+                v = output_ij.get(key, None)
+                if v is None:
+                    return None
+                if isinstance(v, list):
+                    v = v[0]
+                return v.detach().clone()
+
+            occ_ij = _get0("occlusion")      # (n,2,tile_h,tile_w) logits typically
+            unc_ij = _get0("uncertainty")    # (n,1,tile_h,tile_w) log_sigma2
+
+            valid[:, hl:hr, wl:wr] += weight
+
+#            if output is None:
+#                output = {}
+#                for key, val in output_ij.items():
+#                    if isinstance(val, list):
+#                        L = len(val)
+#
+#                        if key == "flow":
+#                            output[key] = [torch.zeros((n, 2, h, w), device=image1.device) for _ in range(L)]
+#                        elif key == "info":
+#                            output[key] = [torch.zeros((n, val[0].shape[1], h, w), device=image1.device) for _ in range(L)]
+#                        elif key == "occlusion":
+#                            # NOTE: logits are usually (n,2,*,*); keep channels consistent with val[0]
+#                            C = val[0].shape[1]
+#                            output[key] = [torch.zeros((n, C, h, w), device=image1.device) for _ in range(L)]
+#                        elif key == "uncertainty":
+#                            C = val[0].shape[1]  # usually 1
+#                            output[key] = [torch.zeros((n, C, h, w), device=image1.device) for _ in range(L)]
+#                        else:
+#                            # generic list output
+#                            C = val[0].shape[1]
+#                            output[key] = [torch.zeros((n, C, h, w), device=image1.device) for _ in range(L)]
+#                    else:
+#                        # Non-list keys: just copy through (rare)
+#                        output[key] = val
+
             if output is None:
                 output = {}
-                for key in output_ij.keys():
-                    if 'flow' in key:
-                        output[key] = [torch.zeros((n, 2, h, w), device=image1.device) for _ in range(len(output_ij[key]))]
-                    elif 'info' in key:
-                        output[key] = [torch.zeros((n, 4, h, w), device=image1.device) for _ in range(len(output_ij[key]))]
-                    else:
-                        output[key] = output_ij[key]
-            
-            for key in output_ij:
-                if key in ("occlusion", "uncertainty"):
-                    # Only one output
-                    output[key][0][:, :, hl:hr, wl:wr] += weight * output_ij[key][0]
-                    continue
 
-                # Normal multi-step outputs (flow, info)
-                for i in range(len(output_ij[key])):
-                    output[key][i][:, :, hl:hr, wl:wr] += weight * output_ij[key][i]
+                # only keep these keys
+                keep_keys = {"flow", "occlusion", "uncertainty"}
+
+                for key, val in output_ij.items():
+                    if key not in keep_keys:
+                        continue
+                    if not isinstance(val, list):
+                        continue
+                    
+                    L = len(val)
+                    C = val[0].shape[1]
+                    output[key] = [torch.zeros((n, C, h, w), device=image1.device) for _ in range(L)]
+
+            keep_keys = {"flow", "occlusion", "uncertainty"}
+
+            for key, val in output_ij.items():
+                if key not in keep_keys:
+                    continue
+                if not isinstance(val, list) or len(val) == 0:
+                    continue
+                    
+                if key == "occlusion":
+                    if occ_ij is not None:
+                        output[key][0][:, :, hl:hr, wl:wr] += weight * occ_ij
+                    continue
+                
+                if key == "uncertainty":
+                    if unc_ij is not None:
+                        output[key][0][:, :, hl:hr, wl:wr] += weight * unc_ij
+                    continue
+                
+                # flow: multi-step list
+                for i in range(len(val)):
+                    output[key][i][:, :, hl:hr, wl:wr] += weight * val[i].detach()
+
+
+
+
+#            for key, val in output_ij.items():
+#                if not isinstance(val, list):
+#                    continue
+#
+#                if key == "occlusion":
+#                    # use our cloned tensor occ_ij (avoids aliasing issues)
+#                    if occ_ij is not None:
+#                        output[key][0][:, :, hl:hr, wl:wr] += weight * occ_ij
+#                    continue
+#
+#                if key == "uncertainty":
+#                    if unc_ij is not None:
+#                        output[key][0][:, :, hl:hr, wl:wr] += weight * unc_ij
+#                    continue
+#
+#                for i in range(len(val)):
+#                    output[key][i][:, :, hl:hr, wl:wr] += weight * val[i].detach()
+
+
+        # Normalize (OUT-OF-PLACE to avoid weird aliasing surprises)
+        denom = valid.unsqueeze(1).clamp_min(1e-9)
+        for key, val in output.items():
+            if not isinstance(val, list):
+                continue
+            for i in range(len(val)):
+                output[key][i] = output[key][i] / denom
+
+        return output                    
+#            for key in output_ij:
+#                if key in ("occlusion", "uncertainty"):
+#                    # Only one output
+#                    output[key][0][:, :, hl:hr, wl:wr] += weight * output_ij[key][0]
+#                    continue
+#
+#                # Normal multi-step outputs (flow, info)
+#                for i in range(len(output_ij[key])):
+#                    output[key][i][:, :, hl:hr, wl:wr] += weight * output_ij[key][i]
+
 
         # Normalize
-        for key in output:
-            for i in range(len(output[key])):
-                output[key][i] /= valid.unsqueeze(1)
-
-        return output
+#        for key in output:
+#            for i in range(len(output[key])):
+#                output[key][i] /= valid.unsqueeze(1)
+#                if key == "uncertainty":
+#                    print("[ALLOC] unc buf max right after zeros:",
+#                          output[key][0].max().item(),
+#                          "storage:", _storage_ptr(output[key][0]))
+#
+#
+#        if "uncertainty" in output:
+#            post = output["uncertainty"][0].detach()
+#            print(f"[STITCH POST-NORM] unc max={post.max().item():.6f} min={post.min().item():.6f} mean={post.mean().item():.6f}")
+#        
+#        return output
 
     def forward_flow(self, image1, image2):
         H, W = image1.shape[2:]
@@ -136,8 +267,10 @@ class InferenceWrapper(object):
         #    for key in output.keys():
         #        output[key][i] = output[key][i][:, :, inf_pad_h // 2: inf_pad_h // 2 + H, inf_pad_w // 2: inf_pad_w // 2 + W]
         for key in output.keys():
-            if key in ("occlusion", "uncertainty"):
-                continue  
+            if not isinstance(output[key], list):
+                continue
+            #if key in ("occlusion", "uncertainty"):
+            #    continue  
             
             for i in range(len(output[key])):
                 output[key][i] = output[key][i][
@@ -157,16 +290,19 @@ class InferenceWrapper(object):
         output = self.forward_flow(img1, img2)
         for i in range(len(output['flow'])):
             for key in output.keys():
-                if key in ("occlusion", "uncertainty"):
-                    # Do NOT tile, do NOT rescale using flow count
+                #if key in ("occlusion", "uncertainty"):
+                #    # Do NOT tile, do NOT rescale using flow count
+                #    continue
+                if not isinstance(output[key], list):
                     continue
 
+                ii = min(i, len(output[key]) - 1)
                 if 'flow' in key:
-                    output[key][i] = F.interpolate(output[key][i], scale_factor=0.5 ** self.scale, mode='bilinear', align_corners=True) * (0.5 ** self.scale)
+                    #output[key][i] = F.interpolate(output[key][i], scale_factor=0.5 ** self.scale, mode='bilinear', align_corners=True) * (0.5 ** self.scale)
+                    output[key][ii] = F.interpolate(output[key][ii], scale_factor=0.5 ** self.scale,mode="bilinear", align_corners=True) * (0.5 ** self.scale)
                 else:
-                    output[key][i] = F.interpolate(output[key][i], scale_factor=0.5 ** self.scale, mode='bilinear', align_corners=True)
-        #print(f"Output flow shape: {output['flow'][0].shape}, H: {H}, W: {W}")
-        #print(output.keys())
+                    #output[key][i] = F.interpolate(output[key][i], scale_factor=0.5 ** self.scale, mode='bilinear', align_corners=True)
+                    output[key][ii] = F.interpolate(output[key][ii], scale_factor=0.5 ** self.scale, mode="bilinear", align_corners=True)
         return output
 
 

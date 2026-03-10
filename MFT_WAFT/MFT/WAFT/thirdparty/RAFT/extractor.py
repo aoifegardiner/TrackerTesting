@@ -123,7 +123,7 @@ class DoubleConv1_up(nn.Module):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
-        print(in_channels)
+        #print(in_channels)
 
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3 ,padding=1, bias=False),

@@ -69,6 +69,8 @@ def _occl_accuracy_from_logits(occl_logits, occl_gt):
 @no_grad()
 def validate_sintel(args, model, iters=12, quiet=False):
     """Validation on Sintel (train split), RAFT-style API but WAFT outputs."""
+    from MFT_WAFT.MFT.WAFT.train_waft_occlusion_uncertainty import uncertainty_metrics
+
     model.eval()
     results = {}
 
@@ -76,28 +78,46 @@ def validate_sintel(args, model, iters=12, quiet=False):
         # reset meters for this dstype
         for m in [val_epe, val_px1, val_px3, val_px5, val_fl, val_unc, val_occ]:
             m.reset()
-
+        # --- simple accumulators for OU validation metrics ---
+        unc_count = 0
+        occ_sum = {}   # accumulate occlusion metrics
+        unc_sum = {}   # accumulate uncertainty metrics
         val_dataset = datasets.MpiSintel(split='training', dstype=dstype, load_occlusion=False)
         val_loader  = data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=False)
 
         for data_blob in tqdm(val_loader, disable=quiet):
-            image1, image2, flow_gt, valid, occl_gt = [x.cuda(non_blocking=True) for x in data_blob]
+            if len(data_blob) == 5:
+                image1, image2, flow_gt, valid, occl_gt = [x.cuda(non_blocking=True) for x in data_blob]
+            else:
+                image1, image2, flow_gt, valid = [x.cuda(non_blocking=True) for x in data_blob]
+                occl_gt = None
+
+            #image1, image2, flow_gt, valid, occl_gt = [x.cuda(non_blocking=True) for x in data_blob]
 
             padder = InputPadder(image1.shape)
-            image1, image2 = padder.pad(image1, image2)
+            #image1, image2 = padder.pad(image1, image2)
+            image1p, image2p = padder.pad(image1, image2)
+
 
             # Forward — WAFT_OU returns dict with lists
-            out = model(image1, image2, iters=iters, test_mode=True)
+            from torch.cuda.amp import autocast
 
-            flow_pred = out['flow'][-1]                    # Bx2xHxW
-            flow_pred = padder.unpad(flow_pred).cpu()
-            flow_gt   = flow_gt.cpu()
-            valid     = valid.cpu()
+            with autocast(enabled=args.mixed_precision):
+                out = model(image1p, image2p, iters=iters, test_mode=True)
+
+            #out = model(image1, image2, iters=iters, test_mode=True)
+
+            #flow_pred = out['flow'][-1]                    # Bx2xHxW
+            flow_pred = padder.unpad(out['flow'][-1]) 
+            #flow_pred = padder.unpad(flow_pred).cpu()
+            #flow_gt   = flow_gt.cpu()
+            #valid     = valid.cpu()
 
             # === Flow metrics ===
             epe = torch.sum((flow_pred - flow_gt) ** 2, dim=1).sqrt()  # [B,H,W]
             mag = torch.sum(flow_gt ** 2, dim=1).sqrt()
-            val = (valid.squeeze(1) >= 0.5)                            # [B,H,W]
+            val_mask = (valid[:, 0] >= 0.5) 
+            #val = (valid.squeeze(1) >= 0.5)                            # [B,H,W]
 
             px1 = (epe < 1.0).float()
             px3 = (epe < 3.0).float()
@@ -105,35 +125,58 @@ def validate_sintel(args, model, iters=12, quiet=False):
             outlier = ((epe > 3.0) & ((epe / (mag + 1e-8)) > 0.05)).float()
 
             # aggregate per-sample (batch=1 here)
-            val_epe.update(epe[val].mean().item(), 1)
-            val_px1.update(px1[val].mean().item(), 1)
-            val_px3.update(px3[val].mean().item(), 1)
-            val_px5.update(px5[val].mean().item(), 1)
-            val_fl.update(100.0 * outlier[val].mean().item(), 1)
+            if val_mask.any():
+                val_epe.update(epe[val_mask].mean().item(), 1)
+                val_px1.update(px1[val_mask].mean().item(), 1)
+                val_px3.update(px3[val_mask].mean().item(), 1)
+                val_px5.update(px5[val_mask].mean().item(), 1)
+                val_fl.update(100.0 * outlier[val_mask].mean().item(), 1)
+            #val_epe.update(epe[val].mean().item(), 1)
+            #val_px1.update(px1[val].mean().item(), 1)
+            #val_px3.update(px3[val].mean().item(), 1)
+            #val_px5.update(px5[val].mean().item(), 1)
+            #val_fl.update(100.0 * outlier[val].mean().item(), 1)
 
             # === Optional: uncertainty / occlusion monitoring ===
             unc, occ = _extract_ou_from_output(out)
+            if isinstance(unc, list): unc = unc[-1]
+            if isinstance(occ, list): occ = occ[-1]
 
+            #if occ is not None and occl_gt is not None and occ.shape[1] == 2:
+            #    occ_logits = padder.unpad(occ)  # [B,2,H,W]
+            #    m = occlusion_metrics(occ_logits, occl_gt, valid)  # returns dict of scalars
+            #    for k, v in m.items():
+            #        occ_sum[k] = occ_sum.get(k, 0.0) + float(v)
+            #    ou_count += 1  # count samples where we computed OU metrics
             if unc is not None:
-                unc = padder.unpad(unc).cpu()
-                # log average predicted uncertainty on valid pixels
-                val_unc.update(unc[val.unsqueeze(1)].mean().item(), 1)
+                log_sigma2 = padder.unpad(unc)   # [B,1,H,W]
+                m = uncertainty_metrics(log_sigma2, flow_pred, flow_gt, valid)
+                for k, v in m.items():
+                    unc_sum[k] = unc_sum.get(k, 0.0) + float(v)
+                # only increment if we didn't already count this sample above
+                if occ is None or occl_gt is None or occ.shape[1] != 2:
+                    unc_count += 1
 
-            if occ is not None:
-                if occ.shape[1] == 2:
-                    # logits → accuracy vs occl_gt
-                    occl_gt = occl_gt.cpu()
-                    occ_unpad = padder.unpad(occ).cpu()
-                    acc = _occl_accuracy_from_logits(occ_unpad, occl_gt)
-                    val_occ.update(acc, 1)
-                else:
-                    # single-channel "occlusion score" — just log mean
-                    occ = padder.unpad(occ).cpu()
-                    val_occ.update(occ[val.unsqueeze(1)].mean().item(), 1)
+            #if unc is not None:
+            #    unc = padder.unpad(unc).cpu()
+            #    # log average predicted uncertainty on valid pixels
+            #    val_unc.update(unc[val.unsqueeze(1)].mean().item(), 1)
+
+            #if occ is not None:
+            #    if occ.shape[1] == 2:
+            #        # logits → accuracy vs occl_gt
+            #        occl_gt = occl_gt.cpu()
+            #        occ_unpad = padder.unpad(occ).cpu()
+            #        acc = _occl_accuracy_from_logits(occ_unpad, occl_gt)
+            #        val_occ.update(acc, 1)
+            #    else:
+            #        # single-channel "occlusion score" — just log mean
+            #        occ = padder.unpad(occ).cpu()
+            #        val_occ.update(occ[val.unsqueeze(1)].mean().item(), 1)
 
         # print + pack results
-        if not quiet:
-            print(f"Validation ({dstype}) EPE: {val_epe.avg:.4f}, 1px: {val_px1.avg:.4f}, 3px: {val_px3.avg:.4f}, 5px: {val_px5.avg:.4f}, F1: {val_fl.avg:.2f}")
+        #if not quiet:
+        #    print(f"Validation ({dstype}) EPE: {val_epe.avg:.4f}, 1px: {val_px1.avg:.4f}, 3px: {val_px3.avg:.4f}, 5px: {val_px5.avg:.4f}, F1: {val_fl.avg:.2f}")
 
         results[f'eval/flow {dstype} EPE']  = val_epe.avg
         results[f'eval/flow {dstype} 1px']  = val_px1.avg
@@ -141,9 +184,21 @@ def validate_sintel(args, model, iters=12, quiet=False):
         results[f'eval/flow {dstype} 5px']  = val_px5.avg
         results[f'eval/flow {dstype} F1']   = val_fl.avg
 
+        if unc_count > 0:
+            for k, s in unc_sum.items():
+                results[f'eval/uncertainty/{dstype}/{k.split("/",1)[1] if "/" in k else k}'] = s / unc_count
+        if not quiet:
+            print(f"[Sintel-{dstype}] EPE {val_epe.avg:.4f} | 1px {val_px1.avg:.4f} | 3px {val_px3.avg:.4f} | 5px {val_px5.avg:.4f} | FL {val_fl.avg:.2f}")
+            if unc_count > 0:
+                if f'eval/uncertainty/{dstype}/epe2_sigma2_corr' in results:
+                    print(f"  Unc corr: {results[f'eval/uncertainty/{dstype}/epe2_sigma2_corr']:.3f}")
+                if f'eval/occlusion/{dstype}/occl_f1' in results:
+                    print(f"  Occ F1: {results[f'eval/occlusion/{dstype}/occl_f1']:.3f}")
+
+
         # only add if we actually saw these signals
-        if val_unc.n > 0: results[f'eval/uncertainty {dstype} mean'] = val_unc.avg
-        if val_occ.n > 0: results[f'eval/occlusion {dstype}']        = val_occ.avg
+        #if val_unc.n > 0: results[f'eval/uncertainty {dstype} mean'] = val_unc.avg
+        #if val_occ.n > 0: results[f'eval/occlusion {dstype}']        = val_occ.avg
 
     return results
 

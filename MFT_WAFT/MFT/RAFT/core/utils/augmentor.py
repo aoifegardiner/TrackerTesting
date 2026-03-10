@@ -152,7 +152,7 @@ class TextAugmenter():
             img1_text = alpha * img1_text + (1 - alpha) * img1
             img2_text = alpha * img2_text + (1 - alpha) * img2
         return img1_text, img2_text, valid
-
+    
 
 class FlowAugmenter:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True, **kwargs):
@@ -466,6 +466,8 @@ class SparseFlowAugmenter:
         img2 = img2[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         occl = occl[y0:y0 + self.crop_size[0], x0:x0 + self.crop_size[1]]
         flow = flow[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
+        #print("Changing flow scale")
+        #flow = flow*scale
         valid = valid[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         return img1, img2, flow, occl, valid
 

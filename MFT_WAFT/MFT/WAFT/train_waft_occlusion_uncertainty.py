@@ -1,5 +1,7 @@
 from __future__ import print_function, division
+from asyncio.log import logger
 import sys
+from xml.parsers.expat import model
 sys.path.append('core')
 #from ipdb import iex
 
@@ -25,6 +27,8 @@ from MFT.RAFT.core.utils.timer import Timer
 
 from MFT.RAFT.core.utils.flow_viz import flow_to_color
 from MFT_WAFT.MFT.WAFT.model import fetch_model
+from MFT_WAFT.MFT.WAFT.model.waft_ou import WAFT_OU_FromFlow
+
 
 
 try:
@@ -46,7 +50,7 @@ except:
 
 # exclude extremly large displacements
 MAX_FLOW = 400
-SUM_FREQ = 10 # 100
+SUM_FREQ = 5 # 100
 VAL_FREQ = 2000 # 5000
 
 
@@ -78,6 +82,10 @@ def sequence_loss(preds_dict, flow_gt, valid, occl_gt=None, gamma=0.8, max_flow=
     preds_dict['occlusion'] = occl_preds
     preds_dict['uncertainty'] = uncertainty_preds
 
+    flow_loss_val = None
+    occl_loss_val = None
+    uncertainty_loss_val = None
+
     #print(f"Flow preds: {len(flow_preds)}, Occl preds: {len(occl_preds)}, Unc preds: {len(uncertainty_preds)}")
     #print(f"Flow[0]: {flow_preds[0].shape}")
 
@@ -86,12 +94,33 @@ def sequence_loss(preds_dict, flow_gt, valid, occl_gt=None, gamma=0.8, max_flow=
                                                      gamma=gamma, max_flow=max_flow, flow_loss_type=flow_loss_type)
         metrics.update(flow_metrics)
         total_loss += (alpha_flow * flow_loss)
+        flow_loss_val = flow_loss.detach().item()
+        metrics['train/loss_flow'] = flow_loss_val
+    else:
+        # still log flow consistency (EPE) even when frozen ---
+        with torch.no_grad():
+            mag = torch.sum(flow_gt**2, dim=1).sqrt()
+            v = (valid[:,0,:,:] >= 0.5) & (mag < max_flow)
+            epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
+            epe = epe.view(-1)[v.view(-1)]
+            if epe.numel() > 0:
+                metrics['train/epe_frozen'] = epe.mean().item()
+            # compute flow loss value for monitoring only
+            flow_loss_val, _ = sequence_flow_loss(
+                flow_preds, flow_gt, valid, occl_gt=occl_gt,
+                gamma=gamma, max_flow=max_flow, flow_loss_type=flow_loss_type
+            )
+            metrics['train/loss_flow_frozen'] = flow_loss_val.item()
+
+
 
     if args.occlusion_module is not None:
         #occl_preds = ensure_list(preds_dict.get('occlusion', []))
         occl_loss, occl_metrics = sequence_occl_loss(occl_preds, occl_gt, flow_gt, valid, gamma=gamma, max_flow=max_flow)
         metrics.update(occl_metrics)
         total_loss += (alpha_occl * occl_loss)
+        occl_loss_val = occl_loss.detach().item()
+        metrics['train/loss_occl'] = occl_loss_val
 
     if args.occlusion_module is not None and 'uncertainty' in args.occlusion_module:
         #uncertainty_preds = ensure_list(preds_dict.get('uncertainty', []))
@@ -103,10 +132,12 @@ def sequence_loss(preds_dict, flow_gt, valid, occl_gt=None, gamma=0.8, max_flow=
                                                                           occl_gt=occl_gt)
         metrics.update(uncertainty_metrics)
         total_loss += (alpha_uncertainty * uncertainty_loss)
+        uncertainty_loss_val = uncertainty_loss.detach().item()
+        metrics['train/loss_uncertainty'] = uncertainty_loss_val
 
     #print(f"Flow preds: {len(flow_preds)}, Occl preds: {len(occl_preds)}, Unc preds: {len(uncertainty_preds)}")
     #print(f"Flow[0]: {flow_preds[0].shape}")
-
+    metrics['train/loss_total'] = total_loss.detach().item()
     return total_loss, metrics
 
 def sequence_occl_loss(occl_preds, occl_gt, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
@@ -129,13 +160,20 @@ def sequence_occl_loss(occl_preds, occl_gt, flow_gt, valid, gamma=0.8, max_flow=
 
     for i in range(n_predictions):
         i_weight = gamma**(n_predictions - i - 1)
-        i_loss = cross_ent_loss(occl_preds[i].softmax(dim=1), occl_gt_thresholded)
+        #i_loss = cross_ent_loss(occl_preds[i].softmax(dim=1), occl_gt_thresholded)
+        i_loss = cross_ent_loss(occl_preds[i], occl_gt_thresholded)
         occl_loss += i_weight * (valid[:, None] * i_loss).mean()
     
-    print("occl_preds[0].shape:", occl_preds[0].shape)
-    print("occl_gt_thresholded.shape:", occl_gt_thresholded.shape,
-          "min:", occl_gt_thresholded.min().item(),
-          "max:", occl_gt_thresholded.max().item())
+    # inside sequence_occl_loss, before cross_ent_loss
+    # estimate pos/neg on-the-fly on the masked pixels (cheap)
+    with torch.no_grad():
+        pos = ((occl_gt_thresholded == 1) & valid).sum().float()
+        neg = ((occl_gt_thresholded == 0) & valid).sum().float()
+        w_pos = neg / (pos + 1e-9)
+        w_neg = pos / (neg + 1e-9)
+        ce_w = torch.tensor([w_neg, w_pos], device=occl_preds[0].device)
+    cross_ent_loss = nn.CrossEntropyLoss(weight=ce_w, reduction='none')
+
 
     metrics = {
         'train/cross_entropy_occl': i_loss.mean().item(),
@@ -275,6 +313,99 @@ def sequence_uncertainty_loss(flow_preds, uncertainty_preds, flow_gt, valid, gam
 
     return uncertainty_loss, metrics
 
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def occlusion_metrics(occ_logits: torch.Tensor, occl_gt: torch.Tensor, valid: torch.Tensor, thr: float = 0.5):
+    """
+    occ_logits: [B,2,H,W]
+    occl_gt:    [B,1,H,W] float in [0,1]
+    valid:      [B,1,H,W] float/bool
+    Returns dict of scalar metrics.
+    """
+    # masks
+    mask = (valid[:, 0] > 0.5)
+
+    # GT labels (0/1)
+    gt = (occl_gt[:, 0] > thr)
+
+    # predicted prob + label
+    prob_occ = F.softmax(occ_logits, dim=1)[:, 1]   # [B,H,W]
+    pred = (prob_occ > thr)
+
+    # only evaluate where mask is true
+    gt_m = gt[mask]
+    pred_m = pred[mask]
+    prob_m = prob_occ[mask]
+
+    if gt_m.numel() == 0:
+        return {"train_diag/occl_mask_frac": 0.0}
+
+    tp = (pred_m & gt_m).sum().item()
+    tn = ((~pred_m) & (~gt_m)).sum().item()
+    fp = (pred_m & (~gt_m)).sum().item()
+    fn = ((~pred_m) & gt_m).sum().item()
+
+    prec = tp / (tp + fp + 1e-9)
+    rec  = tp / (tp + fn + 1e-9)
+    f1   = 2 * prec * rec / (prec + rec + 1e-9)
+    acc  = (tp + tn) / (tp + tn + fp + fn + 1e-9)
+
+    return {
+        "train_diag/occl_acc": acc,
+        "train_diag/occl_prec": prec,
+        "train_diag/occl_rec": rec,
+        "train_diag/occl_f1": f1,
+        "train_diag/occl_pos_rate_gt": gt_m.float().mean().item(),
+        "train_diag/occl_pos_rate_pred": pred_m.float().mean().item(),
+        "train_diag/occl_prob_mean": prob_m.mean().item(),
+        "train_diag/occl_prob_std": prob_m.std(unbiased=False).item(),
+        "train_diag/occl_mask_frac": mask.float().mean().item(),
+    }
+
+
+@torch.no_grad()
+def uncertainty_metrics(log_sigma2: torch.Tensor, flow_pred: torch.Tensor, flow_gt: torch.Tensor, valid: torch.Tensor):
+    """
+    log_sigma2: [B,1,H,W] (clamped)
+    flow_pred:  [B,2,H,W]
+    flow_gt:    [B,2,H,W]
+    valid:      [B,1,H,W]
+    """
+    mask = (valid[:, 0] > 0.5)
+
+    # squared error magnitude
+    epe2 = ((flow_pred - flow_gt) ** 2).sum(dim=1)  # [B,H,W]
+
+    # sigma2
+    sigma2 = torch.exp(log_sigma2[:, 0])            # [B,H,W]
+
+    epe2_m = epe2[mask]
+    sigma2_m = sigma2[mask]
+    log_s_m = log_sigma2[:, 0][mask]
+
+    if epe2_m.numel() == 0:
+        return {"train_diag/unc_mask_frac": 0.0}
+
+    # quick calibration-ish stats: do they track each other at all?
+    # (Pearson correlation)
+    e = epe2_m.float()
+    s = sigma2_m.float()
+    e = e - e.mean()
+    s = s - s.mean()
+    corr = (e * s).mean() / (e.std(unbiased=False) * s.std(unbiased=False) + 1e-9)
+
+    return {
+        "train_diag/epe2_mean": epe2_m.mean().item(),
+        "train_diag/sigma2_mean": sigma2_m.mean().item(),
+        "train_diag/log_sigma2_mean": log_s_m.mean().item(),
+        "train_diag/log_sigma2_min": log_s_m.min().item(),
+        "train_diag/log_sigma2_max": log_s_m.max().item(),
+        "train_diag/epe2_sigma2_corr": corr.item(),
+        "train_diag/unc_mask_frac": mask.float().mean().item(),
+    }
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -282,10 +413,17 @@ def count_parameters(model):
 
 def fetch_optimizer(args, model):
     """ Create the optimizer and learning rate scheduler """
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
+    #optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
+    #optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
 
+    #scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
+    #    pct_start=0.05, cycle_momentum=False, anneal_strategy='linear')
+    
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable, lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
-        pct_start=0.05, cycle_momentum=False, anneal_strategy='linear')
+                                              pct_start=0.05, cycle_momentum=False, anneal_strategy='linear')
+
 
     return optimizer, scheduler
     
@@ -364,12 +502,17 @@ class Logger:
                 data = data.type(torch.uint8)
                 self.writer.add_images(key, data, dataformats='NCHW', global_step=self.total_steps)
             elif 'flow' in key:
-                data = im.detach().cpu().numpy().transpose(0,2,3,1)
-                color_list = []
-                for i in range(data.shape[0]):
-                    color_list.append(flow_to_color(data[i, :, :, :]))
-                    color_image = np.stack(color_list, axis=0)
-                self.writer.add_images(key, color_image, dataformats='NHWC', global_step=self.total_steps)
+                # If this is a real flow field, im is [B,2,H,W]
+                if im.dim() == 4 and im.shape[1] == 2:
+                    data = im.detach().cpu().numpy().transpose(0,2,3,1)  # [B,H,W,2]
+                    color_list = [flow_to_color(data[i]) for i in range(data.shape[0])]
+                    color_image = np.stack(color_list, axis=0)           # [B,H,W,3]
+                    self.writer.add_images(key, color_image, dataformats='NHWC', global_step=self.total_steps)
+                else:
+                    # Otherwise treat it as a generic 1-channel map in 0..255
+                    data = torch.clamp(im, 0., 255.).to(torch.uint8)
+                    self.writer.add_images(key, data, dataformats='NCHW', global_step=self.total_steps)
+        
             else:
                 self.writer.add_images(key, im.type(torch.uint8), dataformats='NCHW', global_step=self.total_steps)
 
@@ -390,7 +533,7 @@ def weight_freezer(model, args):
             raise NotImplementedError('Have to be specified')
         if not args.freeze_features_training:
             raise NotImplementedError('Have to be specified')
-        print("DEBUG WAFT_OU attrs:", dir(model.module))
+        #print("DEBUG WAFT_OU attrs:", dir(model.module))
 
         model.module.occlusion_head.requires_grad_(True)
         model.module.occlusion_head.train()
@@ -415,26 +558,82 @@ def train(args):
     os.environ["CUDA_VISIBLE_DEVICES"] =  ",".join([str(gpu_n) for gpu_n in args.gpus])
 
     args.gpus = range(len(args.gpus))
-    model = fetch_model(args)
-    if args.restore_ckpt:
-        load_ckpt(model, args.restore_ckpt)
 
-    model = nn.DataParallel(model, device_ids=args.gpus)#.cuda()
+    import torch
+    print("visible:", torch.cuda.device_count())
+    print("current:", torch.cuda.current_device(), torch.cuda.get_device_name(0))
 
-    print("Parameter Count: %d" % count_parameters(model))
+    #model = fetch_model(args)
+    #if args.restore_ckpt:
+    #    load_ckpt(model, args.restore_ckpt)
 
-    if args.restore_ckpt is not None:
-        model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
+    #model = nn.DataParallel(model, device_ids=args.gpus)#.cuda()
+
+    #print("Parameter Count: %d" % count_parameters(model))
+
+    #if args.restore_ckpt is not None:
+    #    model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
+
+    # after you build/load your pretrained WAFT model:
+    model  = fetch_model(args)
+    #print("fetch_model returned:", type(model))
+    #print("has flow_model:", hasattr(model, "flow_model"))
+
+    load_ckpt(model, args.restore_ckpt)
+    sd = torch.load(args.restore_ckpt, map_location="cpu")
+    sd = sd["state_dict"] if "state_dict" in sd else sd
+
+    # If the checkpoint was saved from a plain WAFT model,
+    # keys probably start with "da_feature...", "flow_head...", etc.
+    # If it was saved from a wrapper, keys may include "flow_model." prefixes.
+
+    # Normalize key prefixes to match model.flow_model
+    new_sd = {}
+    for k,v in sd.items():
+        k = k.replace("module.", "")
+        # if ckpt has "flow_model.flow_model.", strip one
+        if k.startswith("flow_model.flow_model."):
+            k = k.replace("flow_model.flow_model.", "", 1)   # <-- note: remove BOTH prefixes for loading into flow_model
+        # if ckpt has "flow_model.", strip it for loading into flow_model
+        if k.startswith("flow_model."):
+            k = k.replace("flow_model.", "", 1)
+        new_sd[k] = v
+
+    missing, unexpected = model.flow_model.load_state_dict(new_sd, strict=False)
+    
+
+    
+    # freeze flow model if you don't want to retrain it
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.eval()
+
+    #model = WAFT_OU_FromFlow(flow_model, args, use_rgb_residual=False, detach_flow_features=True)
+
+    # keep heads trainable
+    model.trunk.requires_grad_(True)
+    model.occlusion_head.requires_grad_(True)
+    model.uncertainty_head.requires_grad_(True)
+
+    model.train()  # sets modules to train mode; flow_model stays eval as set above
 
     model.cuda()
-    model = weight_freezer(model, args)
+    #model = weight_freezer(model, args)
 
     train_loader = datasets.fetch_dataloader(args)
+    #trainable = [n for n,p in model.named_parameters() if p.requires_grad]
+    #print("num trainable params:", len(trainable))
+    #print("examples:", trainable[:10])
+    
     optimizer, scheduler = fetch_optimizer(args, model)
 
     total_steps = 0
     scaler = GradScaler(enabled=args.mixed_precision)
     logger = Logger(model, scheduler, logfile_comment=args.name)
+    logger.create_writer_if_not_set()
+
+    #n_trainable_backbone = sum(p.requires_grad for p in model.flow_model.parameters())
+    #print("trainable backbone params:", n_trainable_backbone)
 
 
     should_keep_training = True
@@ -443,18 +642,70 @@ def train(args):
 
         for i_batch, data_blob in enumerate(train_loader):
             # print(i_batch, total_steps, train_timer.iter(), train_timer())
-
+            if data_blob is None:
+                continue  # all samples in this batch were corrupt
+            
             optimizer.zero_grad()
             image1, image2, flow, valid, occl = [x.cuda() for x in data_blob]
+            ##DEBUG
+
+            mag_gt = torch.linalg.norm(flow, dim=1)
+            print("GT mag mean/max:", mag_gt.mean().item(), mag_gt.max().item())
+
 
             if args.add_noise:
                 stdv = np.random.uniform(0.0, 5.0)
                 image1 = (image1 + stdv * torch.randn(*image1.shape).cuda()).clamp(0.0, 255.0)
                 image2 = (image2 + stdv * torch.randn(*image2.shape).cuda()).clamp(0.0, 255.0)
 
-            all_predictions = model(image1, image2, iters=args.iters)
+            from torch.cuda.amp import autocast
 
-            loss, metrics = sequence_loss(all_predictions, flow, valid, occl_gt=occl, gamma=args.gamma, args=args)
+            with autocast(enabled=args.mixed_precision):
+                all_predictions = model(image1, image2, iters=args.iters)
+                loss, metrics = sequence_loss(all_predictions, flow, valid, occl_gt=occl, gamma=args.gamma, args=args)
+
+
+            with torch.no_grad():
+                fp = all_predictions["flow"][-1]          # [B,2,H,W]
+                fg = flow                                # [B,2,H,W]
+
+                print("shapes pred/gt:", fp.shape, fg.shape)
+
+                mag_fp = torch.sqrt((fp**2).sum(dim=1))   # [B,H,W]
+                mag_fg = torch.sqrt((fg**2).sum(dim=1))   # [B,H,W]
+                m = (valid[:,0] > 0.5)
+                scale = (mag_fp[m].mean() / (mag_fg[m].mean() + 1e-9)).item()
+                #print("GT flow mean:", fg.abs().mean().item())
+                #print("Pred flow mean:", fp.abs().mean().item())
+                print("pred_to_gt_mag ratio:", scale)
+                #flow = flow * scale
+                #[print("scaled flow mean:", flow.abs().mean().item())]
+
+
+            #all_predictions = model(image1, image2, iters=args.iters)
+            if total_steps < 5:
+                def stats(name, x):
+                    if isinstance(x, list): x = x[-1]
+                    print(f"{name}: shape={tuple(x.shape)} dtype={x.dtype} "
+                          f"min={x.min().item():.4g} max={x.max().item():.4g} "
+                          f"nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()}")
+
+                stats("flow_est", all_predictions["flow"])
+                if "occlusion" in all_predictions:
+                    stats("occl_logits", all_predictions["occlusion"])
+                if "uncertainty" in all_predictions:
+                    stats("uncert", all_predictions["uncertainty"])
+
+                H, W = image1.shape[-2:]
+                print("image HW:", (H, W))
+                for k in ["flow", "occlusion", "uncertainty"]:
+                    if k in all_predictions:
+                        t = all_predictions[k][-1] if isinstance(all_predictions[k], list) else all_predictions[k]
+                        print(k, "HW:", tuple(t.shape[-2:]))
+
+
+
+            #loss, metrics = sequence_loss(all_predictions, flow, valid, occl_gt=occl, gamma=args.gamma, args=args)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)                
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
@@ -464,12 +715,41 @@ def train(args):
             scaler.update()
 
             logger.push(metrics)
+            if total_steps % 50 == 0:  # cheap, frequent sanity check
+                with torch.no_grad():
+                    if (args.occlusion_module is not None) and ("occlusion" in all_predictions) and (occl is not None):
+                        occ_logits = all_predictions["occlusion"][-1]
+                        logger.write_dict(occlusion_metrics(occ_logits, occl, valid))
+                with torch.no_grad():
+                    if (args.occlusion_module is not None) and ("uncertainty" in all_predictions):
+                        log_sigma2 = all_predictions["uncertainty"][-1]
+                        flow_pred = all_predictions["flow"][-1]
+                        logger.write_dict(uncertainty_metrics(log_sigma2, flow_pred, flow, valid))
+                g = 0.0
+                for p in model.flow_model.parameters():
+                    if p.grad is not None:
+                        g = max(g, p.grad.abs().max().item())
+                logger.write_dict({"debug/flow_backbone_grad_max": g})
 
-            #print("GT mean:", flow.abs().mean().item())
-            #print("Pred mean:", all_predictions['flow'][-1].abs().mean().item())
+                with torch.no_grad():
+                    fp = all_predictions["flow"][-1]
+                    mag_gt = torch.sqrt((flow**2).sum(1))
+                    mag_fp = torch.sqrt((fp**2).sum(1))
+                    m = (valid[:,0] > 0.5) & (mag_gt < MAX_FLOW)
+                    if m.any():
+                        logger.write_dict({
+                            "debug/gt_mag_mean": mag_gt[m].mean().item(),
+                            "debug/pred_mag_mean": mag_fp[m].mean().item(),
+                            "debug/pred_to_gt_mag": (mag_fp[m].mean() / (mag_gt[m].mean() + 1e-9)).item(),
+                        })
+                
 
 
-            if (total_steps == 7) or (total_steps % VAL_FREQ == VAL_FREQ - 1):
+            if (total_steps % VAL_FREQ == VAL_FREQ - 1):#(total_steps == 7) or 
+
+                del all_predictions, loss
+                torch.cuda.empty_cache()
+
                 print('validation ', i_batch, total_steps, train_timer.iter(), train_timer())
                 PATH = args.checkpoints + '/%d_%s.pth' % (total_steps+1, args.name)
                 torch.save(model.state_dict(), PATH)
@@ -478,45 +758,129 @@ def train(args):
                 # print('before val: ', train_timer.iter(), train_timer())
                 for val_dataset in args.validation:
                     if val_dataset == 'chairs':
-                        results.update(evaluate.validate_chairs(model.module))
+                        results.update(evaluate.validate_chairs(model))#.module))
                         # print('val: ', train_timer.iter(), train_timer())
                     elif val_dataset == 'sintel':
-                        results.update(evaluate.validate_sintel(args, model.module))
+                        results.update(evaluate.validate_sintel(args, model))#.module))
                     elif val_dataset == 'sintel_val_subsplit':
-                        results.update(evaluate.validate_sintel(model.module, subsplit='validation'))
+                        results.update(evaluate.validate_sintel(model, subsplit='validation'))
                         # print('val: ', train_timer.iter(), train_timer())
                     elif val_dataset == 'kitti':
-                        results.update(evaluate.validate_kitti(model.module))
+                        results.update(evaluate.validate_kitti(model))#.module))
                         # print('val: ', train_timer.iter(), train_timer())
                 print('after val: ', total_steps, train_timer.iter(), train_timer())
 
                 logger.write_dict(results)
                 
-                fp = all_predictions['flow'][-1]
-                print("flow slice:", fp[0, :, 100:110, 100:110])
+                #train_diag = {}
+                #if (args.occlusion_module is not None) and ("occlusion" in all_predictions) and (occl is not None):
+                #    m = occlusion_metrics(all_predictions["occlusion"][-1], occl, valid)
+                #    train_diag.update({f"train_diag/{k.split('/',1)[1] if '/' in k else k}": v for k, v in m.items()})
 
+                #if (args.occlusion_module is not None) and ("uncertainty" in all_predictions):
+                #    m = uncertainty_metrics(all_predictions["uncertainty"][-1], all_predictions["flow"][-1], flow, valid)
+                #    train_diag.update({f"train_diag/{k.split('/',1)[1] if '/' in k else k}": v for k, v in m.items()})
+
+                #if train_diag:
+                #    logger.write_dict(train_diag)
+
+                #flow_pred = all_predictions["flow"][-1]
+                #print("flow slice:", flow_pred[0, :, 100:110, 100:110])
+
+
+            logger.write_dict({
+              "debug/occl_gt_mean": occl.mean().item(),
+              "debug/occl_gt_pos_rate": (occl > 0.5).float().mean().item(),
+              "debug/loss_total_recon": 5.0*metrics.get("train/loss_occl", 0.0) + metrics.get("train/loss_uncertainty", 0.0),
+            })
+            
+
+            import torch.nn.functional as F
+
+            H, W = image1.shape[-2:]
+
+            LOG_IMG_FREQ = 200
+            if total_steps % LOG_IMG_FREQ == 0:
+
+                # --- Always log inputs and GT ---
                 logger.write_images({'image1': image1, 'image2': image2, 'valid': valid})
                 logger.write_images({'flow_gt': flow})
+
+                # --- Flow estimate + magnitude for debugging ---
+                flow_est = all_predictions['flow'][-1]
+                logger.write_images({'flow_est': flow_est})
+
+                flow_mag = torch.sqrt(torch.sum(flow_est**2, dim=1, keepdim=True))  # [B,1,H,W]
+                mn = flow_mag.amin(dim=[2,3], keepdim=True)
+                mx = flow_mag.amax(dim=[2,3], keepdim=True)
+                flow_mag_vis = (flow_mag - mn) / (mx - mn + 1e-9)
+                logger.write_images({'flow_mag_minmax': flow_mag_vis * 255})
+
+                # --- Occlusion GT (upsample if needed) ---
                 if occl is not None:
-                    logger.write_images({'occl_gt': occl})
-                flow_predictions = all_predictions['flow']
-                logger.write_images({'flow_est': flow_predictions[-1]})
-                if model.module.occlusion_estimation:
-                    occl_predictions = all_predictions['occlusion']
-                    occl_prediction_single = occl_predictions[-1].softmax(dim=1)
-                    logger.write_images({'occl_est_neg': 255. * occl_prediction_single[:,0:1,:,:] })
-                    logger.write_images({'occl_est_pos': 255. * occl_prediction_single[:,1:2,:,:] })
-                if model.module.uncertainty_estimation:
-                    uncertainty_predictions = all_predictions['uncertainty']
-                    sigma2 = torch.exp(uncertainty_predictions[-1])
-                    logger.write_images({'sigma2_est': sigma2 * 255})
-                    sigma2_minmax = (sigma2 - sigma2.min()) / (sigma2.max() - sigma2.min())
+                    occl_vis = occl.float()
+                    if occl_vis.shape[-2:] != (H, W):
+                        occl_vis = F.interpolate(occl_vis, size=(H, W), mode="nearest")
+                    # IMPORTANT: occl keys are auto *255 in Logger, so keep 0..1 here
+                    logger.write_images({'occl_gt': occl_vis})
+
+                # --- Occlusion prediction (probabilities in 0..1) ---
+                if args.occlusion_module is not None and 'occlusion' in all_predictions:
+                    occl_logits = all_predictions['occlusion'][-1]          # [B,2,h,w] or [B,2,H,W]
+                    if occl_logits.shape[-2:] != (H, W):
+                        occl_logits = F.interpolate(occl_logits, size=(H, W), mode="bilinear", align_corners=False)
+
+                    occl_prob = occl_logits.softmax(dim=1)
+                    # IMPORTANT: Logger multiplies by 255 for keys containing 'occl'
+                    logger.write_images({'occl_est_neg': occl_prob[:, 0:1]})
+                    logger.write_images({'occl_est_pos': occl_prob[:, 1:2]})
+
+                    # Debug scalar to confirm it's not constant 0.5 everywhere
+                    logger.write_dict({
+                        'debug/occl_pos_mean': occl_prob[:,1:2].mean().item(),
+                        'debug/occl_pos_std':  occl_prob[:,1:2].std().item(),
+                    })
+
+                with torch.no_grad():
+                    mag = torch.sum(flow**2, dim=1).sqrt()
+                    v = (valid[:,0] >= 0.5) & (mag < MAX_FLOW)
+                    occl_valid = (occl < 0.01) | (occl > 0.99)
+                    m = v & occl_valid[:,0]
+                    logger.write_dict({
+                        "debug/occl_train_mask_frac": m.float().mean().item(),
+                        "debug/occl_train_pos_rate_gt": ( (occl[:,0] > 0.5) & m ).float().sum().item() / (m.float().sum().item() + 1e-9),
+                    })
+
+                with torch.no_grad():
+                    a = all_predictions["uncertainty"][-1]
+                    logger.write_dict({
+                        "debug/unc_frac_at_max": (a >= args.var_max - 1e-4).float().mean().item(),
+                        "debug/unc_frac_at_min": (a <= args.var_min + 1e-4).float().mean().item(),
+                    })
+                
+
+
+
+                # --- Uncertainty prediction (visualize min-max) ---
+                if (args.occlusion_module is not None) and ('uncertainty' in args.occlusion_module) and ('uncertainty' in all_predictions):
+                    unc = all_predictions['uncertainty'][-1]                # [B,1,h,w] or [B,1,H,W]
+                    if unc.shape[-2:] != (H, W):
+                        unc = F.interpolate(unc, size=(H, W), mode="bilinear", align_corners=False)
+
+                    sigma2 = torch.exp(unc)
+
+                    # Per-image min-max normalization for display
+                    mn = sigma2.amin(dim=[2,3], keepdim=True)
+                    mx = sigma2.amax(dim=[2,3], keepdim=True)
+                    sigma2_minmax = (sigma2 - mn) / (mx - mn + 1e-9)
+
+                    # 'sigma' keys are clamped but NOT scaled inside Logger, so pass 0..255 here
                     logger.write_images({'sigma2_est_minmax': sigma2_minmax * 255})
-                    sigma = torch.sqrt(sigma2)
-                    logger.write_images({'sigma_est': sigma * 255})
-                    sigma_minmax = (sigma - sigma.min()) / (sigma.max() - sigma.min())
-                    logger.write_images({'sigma_est_minmax': sigma_minmax * 255})
-                model = weight_freezer(model, args)
+
+                    logger.write_dict({
+                        'debug/unc_mean': unc.mean().item(),
+                        'debug/unc_std':  unc.std().item(),
+                    })
 
             total_steps += 1
 

@@ -138,6 +138,9 @@ class ViTWarpV8(nn.Module):
 
         # Store original frame dimensions for later use if needed
         H_orig, W_orig = image1.shape[:2]
+        
+#        print("image1 shape entering forward", image1.shape)
+#        print("pre-norm dtype/min/max", image1.dtype, image1.min().item(), image1.max().item())
 
         # Normalization
         image1 = self.normalize_image(image1)
@@ -175,7 +178,15 @@ class ViTWarpV8(nn.Module):
         for itr in range(iters):
             flow_2x = flow_2x.detach()
             coords2 = (coords_grid(N, H//2, W//2, device=image1.device) + flow_2x).detach()
+            coords0 = coords_grid(N, H//2, W//2, device=image1.device)
+
+            
+            
             warp_2x = bilinear_sampler(fmap2_2x, coords2.permute(0, 2, 3, 1))
+            if itr == 0:
+                diff = (warp_2x - fmap2_2x).abs().mean().item()
+                #print("identity warp diff:", diff)
+
             refine_inp = self.warp_linear(torch.cat([fmap1_2x, warp_2x, net, flow_2x], dim=1))
             refine_outs = self.refine_net(refine_inp)
             net = self.refine_transform(torch.cat([refine_outs['out'], net], dim=1))

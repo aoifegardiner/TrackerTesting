@@ -3,15 +3,14 @@ import sys
 import datetime
 from SurgT.src import utils
 #from src.sample_tracker import Tracker
-from SurgT.src.waft_left import MFTWAFTTrackerSurgT as Tracker
-#from SurgT.src.mft_left import MFTRAFTTrackerSurgT as Tracker
+#from SurgT.src.waft_left import MFTWAFTTrackerSurgT as Tracker
+from SurgT.src.mft_left import MFTRAFTTrackerSurgT as Tracker
 #from SurgT.src.TAP import TAPIRTrackerSurgT as Tracker
 
 import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-
 
 
 class Timer:
@@ -450,6 +449,15 @@ class AnchorResults:
         self.n_misses_successive_2d = 0
         self.n_misses_successive_3d = 0
 
+    def to_frame_series(self):
+        return {
+            "iou_list": self.iou_list,
+            "err_2d": self.err_2d,
+            "err_3d": self.err_3d,
+            "n_visible_and_not_diff": int(self.n_visible_and_not_diff),
+            "n_excessive_frames": int(self.n_excessive_frames),
+        }
+
 
     def calculate_bbox_metrics(self, bbox1_gt, bbox1_p, bbox2_gt, bbox2_p, is_track_fail_2d, is_track_fail_3d):
         """
@@ -698,28 +706,91 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
     import pickle
     import cv2 as cv
     from pathlib import Path
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+#    def sample_flow_at_points(flow_xy_hw: torch.Tensor, pts_xy: torch.Tensor):
+#        """
+#        flow_xy_hw: (2,H,W) pixels
+#        pts_xy: (N,2) pixel coords (x,y) in SAME resolution as flow
+#        returns: (N,2) sampled flow at those points
+#        """
+#        assert flow_xy_hw.ndim == 3 and flow_xy_hw.shape[0] == 2
+#        H, W = flow_xy_hw.shape[1:]
+#
+#        x = pts_xy[:, 0]
+#        y = pts_xy[:, 1]
+#
+#        # normalize to [-1,1]
+#        x_norm = (x / (W - 1)) * 2 - 1
+#        y_norm = (y / (H - 1)) * 2 - 1
+#        grid = torch.stack([x_norm, y_norm], dim=-1).view(1, -1, 1, 2)
+#
+#        flow_bchw = flow_xy_hw.unsqueeze(0)  # (1,2,H,W)
+#        samp = F.grid_sample(flow_bchw, grid, align_corners=True)  # (1,2,N,1)
+#        samp = samp[0, :, :, 0].T  # (N,2)
+#        return samp
+
+
+#    def stats_in_bbox(map_t, bbox_xywh, img_wh, assume_map_matches_img=False):
+#        """
+#        map_t: torch tensor (H,W) or (1,H,W) etc.
+#        bbox_xywh: (x,y,w,h) in IMAGE pixel coords
+#        img_wh: (W_img, H_img)
+#        If assume_map_matches_img=False, bbox is scaled to map resolution.
+#        """
+#        if map_t is None or bbox_xywh is None:
+#            return None
+#
+#        m = map_t.detach().float().cpu()
+#        while m.ndim > 2:
+#            m = m[0]
+#        Hm, Wm = m.shape[-2], m.shape[-1]
+#
+#        W_img, H_img = img_wh
+#        x, y, w, h = bbox_xywh
+#        x1, y1, x2, y2 = x, y, x + w, y + h
+#
+#        if not assume_map_matches_img:
+#            sx = Wm / float(W_img)
+#            sy = Hm / float(H_img)
+#            x1, x2 = x1 * sx, x2 * sx
+#            y1, y2 = y1 * sy, y2 * sy
+#
+#        x1 = int(np.clip(np.floor(x1), 0, Wm - 1))
+#        x2 = int(np.clip(np.ceil (x2), 0, Wm))
+#        y1 = int(np.clip(np.floor(y1), 0, Hm - 1))
+#        y2 = int(np.clip(np.ceil (y2), 0, Hm))
+#
+#        if x2 <= x1 or y2 <= y1:
+#            return None
+#
+#        roi = m[y1:y2, x1:x2].numpy()
+#        return roi.mean(), roi.min(), roi.max()
+
 
     # === Setup output directory ===
-    base_output = config_results.get("results_path", "./results")
-    output_dir = Path(base_output) / "case1_video1_left_0212_2"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "case1_video1_left_predictions_0212_2.pkl"
-
-    # === Visualization setup ===
-    if not is_visualization_off:
-        window_name = "MFT Left Stream Tracking"
-        thick = 2
-        cv.namedWindow(window_name, cv.WINDOW_KEEPRATIO)
-
-    # === Initialize Video Writer ===
-    video_out_path = output_dir / "case1_video1_left_tracking_0212_2.mp4"
-    writer = None  # we'll initialize once we know the frame size
+#    base_output = config_results.get("results_path", "./results")
+#    output_dir = Path(base_output) / "case1_video1_left_0802_1"
+#    output_dir.mkdir(parents=True, exist_ok=True)
+#    output_file = output_dir / "case1_video1_left_predictions_0802_1.pkl"
+#
+#    # === Visualization setup ===
+#    if not is_visualization_off:
+#        window_name = "MFT Left Stream Tracking"
+#        thick = 2
+#        cv.namedWindow(window_name, cv.WINDOW_KEEPRATIO)
+#
+#    # === Initialize Video Writer ===
+#    video_out_path = output_dir / "case1_video1_left_tracking_0802_1.mp4"
+#    writer = None  # we'll initialize once we know the frame size
 
     # === Initialize ===
     t = None
     predicted_positions = []
     occlusion = []
-    uncertainty_scores = []
+    sigma_scores = []
     frame_indices = []
     is_track_fail_2d = False
 
@@ -736,32 +807,32 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
         im1, _ = v.split_frame(frame)
 
         # Initialize writer once we know frame size
-        if writer is None:
-            h, w = im1.shape[:2]
-            fps = getattr(v, "fps", 20)  # try to use dataset fps or default to 20
-            fourcc = cv.VideoWriter_fourcc(*'mp4v')
-            writer = cv.VideoWriter(str(video_out_path), fourcc, fps, (w, h))
-            print(f"[DEBUG] Initialized video writer: {video_out_path} ({w}x{h}@{fps}fps)")
+#        if writer is None:
+#            h, w = im1.shape[:2]
+#            fps = getattr(v, "fps", 20)  # try to use dataset fps or default to 20
+#            fourcc = cv.VideoWriter_fourcc(*'mp4v')
+#            writer = cv.VideoWriter(str(video_out_path), fourcc, fps, (w, h))
+#            print(f"[DEBUG] Initialized video writer: {video_out_path} ({w}x{h}@{fps}fps)")
 
         # Skip frames before anchor (run only for the first one)
         if v.frame_counter < anch:
             continue
 
         # Stop after the first anchor’s run (no looping through all anchors)
-        if v.frame_counter > anch and t is None:
-            break
+#        if v.frame_counter > anch and t is None:
+#            break
 
         # Read GT bbox (left only)
         bbox1_gt, bbox2_gt, is_difficult, is_visible_in_both_stereo = v.get_bbox_gt(v.frame_counter)
 
         # === Initialize tracker at the anchor ===
         if t is None:
-            print(
-                f"[DEBUG] Anchor frame {v.frame_counter}: "
-                f"bbox1_gt={bbox1_gt}, "
-                f"is_difficult={is_difficult}, "
-                f"is_inside={v.is_bbox_inside_image(bbox1_gt, bbox1_gt) if bbox1_gt else 'N/A'}"
-            )
+            #print(
+            #    f"[DEBUG] Anchor frame {v.frame_counter}: "
+            #    f"bbox1_gt={bbox1_gt}, "
+            #    f"is_difficult={is_difficult}, "
+            #    f"is_inside={v.is_bbox_inside_image(bbox1_gt, bbox1_gt) if bbox1_gt else 'N/A'}"
+            #)
             if bbox1_gt is not None and not is_difficult:
                 if v.is_bbox_inside_image(bbox1_gt, bbox1_gt):
                     t = Tracker(im1, bbox1_gt)
@@ -775,11 +846,42 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
             continue
 
         time.monitor_time_start()
+
+        #meta = t.tracker.track(im1)
+        #flow_result = meta.result if hasattr(meta, "result") else meta
+        # existing bbox update (call your wrapper method to keep behavior)
+        #result = t.tracker_update(im1)
+        
         result = t.tracker_update(im1)
+        flow_result = result["flow_result"]   # return this from tracker_update (see below)
 
         bbox1_p = result["bbox"]
+
+        flow = flow_result.flow  # (2,H,W)
+        #flow = result["flow"]  # (2,H,W) tensor
+        bbox1_gt, _, _, _ = v.get_bbox_gt(v.frame_counter)
+
+        #if bbox1_gt is not None:
+            #gt_u, gt_v, gt_w, gt_h = bbox1_gt
+            #gt_center = torch.tensor(
+            #    [[gt_u + gt_w / 2, gt_v + gt_h / 2]],
+            #    device=flow.device,
+            #    dtype=torch.float32
+            #)
+
+            #flow_at_gt = sample_flow_at_points(flow, gt_center)[0]
+            #pred_center = gt_center[0] + flow_at_gt
+
+            #print(
+            #    f"[FLOW@GT] frame {v.frame_counter} | "
+            #    f"GT center {gt_center[0].tolist()} | "
+            #    f"flow {flow_at_gt.tolist()} | "
+            #    f"pred center {pred_center.tolist()}"
+            #)
+
+
         occl_map = result["occlusion"]
-        uncert_map = result["uncertainty"]
+        sigma_map = result["sigma"]
 
         #bbox1_p = t.tracker_update(im1)
         time.monitor_time_end()
@@ -792,24 +894,35 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
         predicted_positions.append(bbox1_p)
         frame_indices.append(v.frame_counter)
         occlusion.append(occl_map)
-        uncertainty_scores.append(uncert_map)
+        sigma_scores.append(sigma_map)
         print(f"[Frame {v.frame_counter:03d}] Predicted bbox (left): {bbox1_p}")
 
-        # === Print occlusion stats ===
-        if occl_map is not None:
-            occ_np = occl_map.detach().cpu().numpy()
-            print(
-                f"   Occlusion stats → "
-                f"mean={occ_np.mean():.4f}, "
-                f"min={occ_np.min():.4f}, "
-                f"max={occ_np.max():.4f}"
-            )
-        else:
-            print("   Occlusion stats → None")
+        #H_img, W_img = im1.shape[:2]
+
+        #occ_stats = stats_in_bbox(occl_map, bbox1_p, (W_img, H_img))
+        #sig_stats = stats_in_bbox(sigma_map, bbox1_p, (W_img, H_img))
+
+        #if occ_stats:
+        #    print(f"   Occlusion (in bbox) → mean={occ_stats[0]:.4f}, min={occ_stats[1]:.4f}, max={occ_stats[2]:.4f}")
+        #if sig_stats:
+        #    print(f"   Sigma     (in bbox) → mean={sig_stats[0]:.4f}, min={sig_stats[1]:.4f}, max={sig_stats[2]:.4f}")
+
+
+        ## === Print occlusion stats ===
+        #if occl_map is not None:
+        #    occ_np = occl_map.detach().cpu().numpy()
+        #    print(
+        #        f"   Occlusion stats → "
+        #        f"mean={occ_np.mean():.4f}, "
+        #        f"min={occ_np.min():.4f}, "
+        #        f"max={occ_np.max():.4f}"
+        #    )
+        #else:
+        #    print("   Occlusion stats → None")
 
         # === Print sigma / uncertainty stats ===
-        if uncert_map is not None:
-            sigma_np = uncert_map.detach().cpu().numpy()
+        if sigma_map is not None:
+            sigma_np = sigma_map.detach().cpu().numpy()
             print(
                 f"   Sigma stats     → "
                 f"mean={sigma_np.mean():.4f}, "
@@ -826,39 +939,39 @@ def assess_anchor(time, v, anch, ar, kss, is_visualization_off, config_results):
         ## Visualization (for display + video)
         line_thickness = 2
         frame_aug = draw_bb_in_frame(im1, None, bbox1_gt, bbox1_p, None, None, is_difficult, line_thickness)
-        writer.write(frame_aug)  # <--- write augmented frame to video
-
-        if not is_visualization_off:
-            cv.imshow(window_name, frame_aug)
-            cv.waitKey(1)
-
-        # Continue until terminator frame
-        if v.frame_counter >= kss.TERMINATOR_FRAME:
-            break
+#        writer.write(frame_aug)  # <--- write augmented frame to video
+#
+#        if not is_visualization_off:
+#            cv.imshow(window_name, frame_aug)
+#            cv.waitKey(1)
+#
+#        # Continue until terminator frame
+#        if v.frame_counter >= kss.TERMINATOR_FRAME:
+#            break
 
     # === Save results ===
     results = {
         "frame_indices": frame_indices,
         "predicted_bboxes": predicted_positions,
         "occlusion_maps": occlusion,
-        "uncertainty_scores": uncertainty_scores
+        "sigma_scores": sigma_scores
     }
 
-    with open(output_file, "wb") as f:
-        pickle.dump(results, f)
-
-    print(f"\n✅ Saved {len(predicted_positions)} predictions to {output_file}")
-
-
-    # === Release writer and print performance ===
-    if writer is not None:
-        writer.release()
-        print(f"🎥 Tracking video saved to: {video_out_path}")
-
-    time.print_time_performance()
-
-    if not is_visualization_off:
-        cv.destroyAllWindows()
+#    with open(output_file, "wb") as f:
+#        pickle.dump(results, f)
+#
+#    print(f"\n✅ Saved {len(predicted_positions)} predictions to {output_file}")
+#
+#
+#    # === Release writer and print performance ===
+#    if writer is not None:
+#        writer.release()
+#        print(f"🎥 Tracking video saved to: {video_out_path}")
+#
+#    time.print_time_performance()
+#
+#    if not is_visualization_off:
+#        cv.destroyAllWindows()
 
 #def assess_anchor(time, v, anch, ar, kss, is_visualization_off):
 #    # Create window for results animation
@@ -985,7 +1098,7 @@ def assess_keypoint(time, v, kpt_anchors, kss, stats_kpt, config_results, is_vis
         stats_kpt.append_stats(stats_anchor)
         # Re-start video for next anchor, or for next keypoint
         v.video_restart()
-        return   
+        #return   
     assert len(stats_kpt.acc) == len(kpt_anchors) # Check that we have a acc list for each anchor
     stats_kpt.merge_stats()
 
@@ -1091,6 +1204,8 @@ def calculate_results(config, valid_or_test, is_visualization_off):
         print('{} dataset'.format(valid_or_test).upper())
         cases = utils.get_cases(config_data)
         #cases = cases[1:]  # Only the second case for debugging
+        #cases = cases[3:]  # Only the fourth case for debugging
+        #cases = cases[4:]  # Only the fifth case for debugging
         # Go through each case
         for case in cases:
             stats_case = Statistics()  # Statistics for a specific case

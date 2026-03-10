@@ -41,7 +41,7 @@ def coords_corr(corr, idx, b, x, y):
     x = torch.clamp(x, 0, W-1).long()
     y = torch.clamp(y, 0, H-1).long()
     res = corr[b, idx[:, 2], idx[:, 1], y, x] * mask.float()
-    print(mask.requires_grad, x.requires_grad, y.requires_grad, res.requires_grad)
+    #print(mask.requires_grad, x.requires_grad, y.requires_grad, res.requires_grad)
     return res
 
 def bilinear_sampling_corr(corr, idx1, idx2):
